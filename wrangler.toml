@@ -1,0 +1,17 @@
+name = "emby-account-manager"
+main = "src/worker.js"
+compatibility_date = "2024-12-01"
+
+# Deploy to Cloudflare 按钮所需的 KV 声明：
+# 部署时 Cloudflare 会自动创建新的 KV 命名空间并填入 id。
+# 手动部署时请运行 `wrangler kv namespace create KV` 并把 id 填到下面。
+[[kv_namespaces]]
+binding = "KV"
+id = "REPLACE_WITH_YOUR_KV_ID"
+
+[vars]
+# 可选：给面板设置访问密码。设置后打开页面需要输入密码。留空则无需密码。
+ACCESS_PASSWORD = ""
+# Emby 密码加密密钥（推荐设置，任意长随机字符串）。留空则密码明文存 KV。
+# 可用 `openssl rand -hex 32` 生成。
+ENCRYPT_KEY = ""
