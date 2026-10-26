@@ -38,10 +38,25 @@ async function embyFetch(baseUrl, path, options = {}, timeoutMs = 12000) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    return await fetch(`${baseUrl}${path}`, { ...options, signal: ctrl.signal });
+    return await fetch(`${baseUrl}${path}`, {
+      ...options,
+      headers: { 'User-Agent': BROWSER_UA, ...(options.headers || {}) },
+      signal: ctrl.signal,
+    });
   } finally {
     clearTimeout(timer);
   }
+}
+
+/** 浏览器 UA：部分 Emby 站在 CDN/WAF 后面，会拦截非浏览器 UA（Workers 默认 UA 常被 403） */
+const BROWSER_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+
+/** 读取响应体片段用于错误定位（截断，防超大响应） */
+async function bodySnippet(res) {
+  try {
+    const text = await res.text();
+    return text.replace(/\s+/g, ' ').slice(0, 160);
+  } catch (_) { return ''; }
 }
 
 /** 登录 Emby，返回 { userId, token, serverId }；失败抛错 */
@@ -57,7 +72,8 @@ async function loginEmby(line) {
       signal: ctrl.signal,
       headers: {
         'Content-Type': 'application/json',
-        'X-Emby-Authorization': `MediaBrowser Client="EmbyManager", Device="Manager", DeviceId="emby-manager-cf", Version="1.0"`,
+        'User-Agent': BROWSER_UA,
+        'X-Emby-Authorization': `MediaBrowser Client="Emby for Android", Device="emby-manager", DeviceId="emby-manager-cf", Version="3.2.50"`,
       },
       body: JSON.stringify({ Username: line.username, Pw: line.password || '' }),
     });
@@ -68,7 +84,8 @@ async function loginEmby(line) {
   }
   if (!res.ok) {
     if (res.status === 401) throw new Error('用户名或密码错误');
-    throw new Error(`登录失败：HTTP ${res.status}`);
+    const snippet = await bodySnippet(res);
+    throw new Error(`登录失败：HTTP ${res.status}${snippet ? ' | ' + snippet : ''}`);
   }
   const data = await res.json();
   return { userId: data.User.Id, token: data.AccessToken, serverId: data.ServerId };
