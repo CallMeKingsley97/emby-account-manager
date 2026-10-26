@@ -48,8 +48,8 @@ async function embyFetch(baseUrl, path, options = {}, timeoutMs = 12000) {
   }
 }
 
-/** 浏览器 UA：部分 Emby 站在 CDN/WAF 后面，会拦截非浏览器 UA（Workers 默认 UA 常被 403） */
-const BROWSER_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+/** 使用 SenPlayer（iOS 播放器）UA：部分站点仅放行播放器客户端，拦 Chrome 与 Workers 默认 UA */
+const BROWSER_UA = 'SenPlayer/1.0 (iPhone; iOS 18.0; Scale/3.00)';
 
 /** 读取响应体片段用于错误定位（截断，防超大响应） */
 async function bodySnippet(res) {
