@@ -33,14 +33,14 @@ function buildBaseUrl(line) {
   return base.replace(/\/+$/, '');
 }
 
-/** 调用 Emby API，超时 12 秒 */
+/** 调用 Emby API，超时 12 秒；可通过 options.headers 覆盖身份 UA */
 async function embyFetch(baseUrl, path, options = {}, timeoutMs = 12000) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     return await fetch(`${baseUrl}${path}`, {
       ...options,
-      headers: { 'User-Agent': BROWSER_UA, ...(options.headers || {}) },
+      headers: { ...(options.headers || {}) },
       signal: ctrl.signal,
     });
   } finally {
@@ -48,8 +48,18 @@ async function embyFetch(baseUrl, path, options = {}, timeoutMs = 12000) {
   }
 }
 
-/** 使用 SenPlayer（iOS 播放器）UA：部分站点仅放行播放器客户端，拦 Chrome 与 Workers 默认 UA */
-const BROWSER_UA = 'SenPlayer/1.0 (iPhone; iOS 18.0; Scale/3.00)';
+/**
+ * 登录身份列表：部分站点按客户端白名单放行（仅常见播放器可登录），
+ * 会同时校验 UA 和 X-Emby-Authorization 的 Client 字段。
+ * 依次尝试，命中一个即用该身份完成登录及后续 API 调用。
+ */
+const CLIENT_IDENTITIES = [
+  { client: 'SenPlayer', device: 'iPhone', version: '1.5.4', ua: 'SenPlayer/1.5.4 (iPhone; iOS 18.0; Scale/3.00)' },
+  { client: 'VidHub', device: 'iPhone', version: '1.4.8', ua: 'VidHub/1.4.8 (iPhone; iOS 18.0; Scale/3.00)' },
+  { client: 'Fileball', device: 'iPhone', version: '1.4.1', ua: 'Fileball/1.4.1 (iPhone; iOS 18.0; Scale/3.00)' },
+  { client: 'Infuse', device: 'iPhone', version: '8.1.2', ua: 'Infuse/8.1.2 (iPhone; iOS 18.0; Scale/3.00)' },
+  { client: 'Emby for iOS', device: 'iPhone', version: '2.3.4', ua: 'Emby/2.3.4 (iPhone; iOS 18.0; Scale/3.00)' },
+];
 
 /** 读取响应体片段用于错误定位（截断，防超大响应） */
 async function bodySnippet(res) {
@@ -59,41 +69,48 @@ async function bodySnippet(res) {
   } catch (_) { return ''; }
 }
 
-/** 登录 Emby，返回 { userId, token, serverId }；失败抛错 */
+/** 登录 Emby，返回 { userId, token, serverId, identity }；失败抛错 */
 async function loginEmby(line) {
   const base = buildBaseUrl(line);
   const url = `${base}/emby/Users/AuthenticateByName`;
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 12000);
-  let res;
-  try {
-    res = await fetch(url, {
-      method: 'POST',
-      signal: ctrl.signal,
-      headers: {
-        'Content-Type': 'application/json',
-        'User-Agent': BROWSER_UA,
-        'X-Emby-Authorization': `MediaBrowser Client="Emby for Android", Device="emby-manager", DeviceId="emby-manager-cf", Version="3.2.50"`,
-      },
-      body: JSON.stringify({ Username: line.username, Pw: line.password || '' }),
-    });
-  } catch (e) {
-    throw new Error(`无法连接服务器 ${base}（超时或网络错误）`);
-  } finally {
-    clearTimeout(timer);
-  }
-  if (!res.ok) {
+  const errors = [];
+  for (const identity of CLIENT_IDENTITIES) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 12000);
+    let res;
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        signal: ctrl.signal,
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': identity.ua,
+          'X-Emby-Authorization': `MediaBrowser Client="${identity.client}", Device="${identity.device}", DeviceId="emby-manager-cf", Version="${identity.version}"`,
+        },
+        body: JSON.stringify({ Username: line.username, Pw: line.password || '' }),
+      });
+    } catch (e) {
+      throw new Error(`无法连接服务器 ${base}（超时或网络错误）`);
+    } finally {
+      clearTimeout(timer);
+    }
+    if (res.ok) {
+      const data = await res.json();
+      return { userId: data.User.Id, token: data.AccessToken, serverId: data.ServerId, identity };
+    }
+    // 401 说明请求已通过客户端过滤、到达认证环节，换身份也没用
     if (res.status === 401) throw new Error('用户名或密码错误');
     const snippet = await bodySnippet(res);
-    throw new Error(`登录失败：HTTP ${res.status}${snippet ? ' | ' + snippet : ''}`);
+    errors.push(`${identity.client}: HTTP ${res.status}${snippet ? ' | ' + snippet : ''}`);
   }
-  const data = await res.json();
-  return { userId: data.User.Id, token: data.AccessToken, serverId: data.ServerId };
+  throw new Error(errors.join('；'));
 }
 
-/** 拉取资源数量统计（Items/Counts） */
-async function fetchCounts(baseUrl, token) {
-  const res = await embyFetch(baseUrl, `/emby/Items/Counts?api_key=${encodeURIComponent(token)}`);
+/** 拉取资源数量统计（Items/Counts），ua 沿用登录成功时的客户端身份 */
+async function fetchCounts(baseUrl, token, ua) {
+  const res = await embyFetch(baseUrl, `/emby/Items/Counts?api_key=${encodeURIComponent(token)}`, {
+    headers: { 'User-Agent': ua },
+  });
   if (!res.ok) throw new Error(`获取资源数量失败：HTTP ${res.status}`);
   const d = await res.json();
   return {
@@ -106,10 +123,10 @@ async function fetchCounts(baseUrl, token) {
   };
 }
 
-/** 拉取最近一次观看时间：取当前用户的播放历史最新一条 */
-async function fetchLastPlayed(baseUrl, token, userId) {
+/** 拉取最近一次观看时间：取当前用户的播放历史最新一条，ua 沿用登录成功时的客户端身份 */
+async function fetchLastPlayed(baseUrl, token, userId, ua) {
   const path = `/emby/Users/${encodeURIComponent(userId)}/PlayedItems/Latest?Limit=1&api_key=${encodeURIComponent(token)}`;
-  let res = await embyFetch(baseUrl, path);
+  let res = await embyFetch(baseUrl, path, { headers: { 'User-Agent': ua } });
   if (res.ok) {
     const arr = await res.json().catch(() => []);
     if (Array.isArray(arr) && arr.length > 0) {
@@ -122,7 +139,7 @@ async function fetchLastPlayed(baseUrl, token, userId) {
   // 后备方案：用 Items 接口按播放时间倒序
   const fallback = `/emby/Items?SortBy=DatePlayed&SortOrder=Descending&Limit=1&Filters=IsPlayed&Recursive=true` +
     `&UserId=${encodeURIComponent(userId)}&api_key=${encodeURIComponent(token)}`;
-  res = await embyFetch(baseUrl, fallback);
+  res = await embyFetch(baseUrl, fallback, { headers: { 'User-Agent': ua } });
   if (!res.ok) throw new Error(`获取观看记录失败：HTTP ${res.status}`);
   const data = await res.json().catch(() => ({ Items: [] }));
   const item = data.Items && data.Items[0];
@@ -253,8 +270,8 @@ async function handleApi(request, env, url, path) {
     // 拉取初始数据
     const base = buildBaseUrl(main.line);
     let counts = null, lastPlayed = {};
-    try { counts = await fetchCounts(base, main.token); } catch (_) {}
-    try { lastPlayed = await fetchLastPlayed(base, main.token, main.userId); } catch (_) {}
+    try { counts = await fetchCounts(base, main.token, main.identity.ua); } catch (_) {}
+    try { lastPlayed = await fetchLastPlayed(base, main.token, main.userId, main.identity.ua); } catch (_) {}
 
     const id = crypto.randomUUID();
     const account = await encryptAccountLines(env, {
@@ -303,8 +320,8 @@ async function handleApi(request, env, url, path) {
           const login = await loginEmby(line);
           const base = buildBaseUrl(line);
           let counts = null, lastPlayed = {};
-          try { counts = await fetchCounts(base, login.token); } catch (_) {}
-          try { lastPlayed = await fetchLastPlayed(base, login.token, login.userId); } catch (_) {}
+          try { counts = await fetchCounts(base, login.token, login.identity.ua); } catch (_) {}
+          try { lastPlayed = await fetchLastPlayed(base, login.token, login.userId, login.identity.ua); } catch (_) {}
           result = {
             userId: login.userId, token: login.token, serverId: login.serverId,
             counts: counts || account.counts || {},
