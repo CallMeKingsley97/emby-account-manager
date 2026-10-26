@@ -455,6 +455,7 @@ const HTML_PAGE = `<!DOCTYPE html>
     }
   }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   html { -webkit-text-size-adjust: 100%; }
   body {
     margin: 0; background: var(--bg); color: var(--text);
