@@ -26,8 +26,18 @@ function checkAuth(request, env) {
 
 /** 把线路配置拼成 baseUrl（去除末尾斜杠） */
 function buildBaseUrl(line) {
-  const proto = line.https ? 'https' : 'http';
-  let base = `${proto}://${line.host}`;
+  let host = (line.host || '').trim();
+  // 兼容粘贴完整 URL 的情况：host 里带了协议前缀则提取协议，避免拼出 https://https://...
+  const m = host.match(/^(https?):\/\//i);
+  let proto;
+  if (m) {
+    proto = m[1].toLowerCase();
+    host = host.replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+  } else {
+    // https 兼容布尔 / 字符串 / 数字几种存储形态
+    proto = (line.https === true || line.https === 'true' || line.https === 1) ? 'https' : 'http';
+  }
+  let base = `${proto}://${host}`;
   if (line.port) base += `:${line.port}`;
   if (line.path) base += line.path.startsWith('/') ? line.path : '/' + line.path;
   return base.replace(/\/+$/, '');
@@ -103,7 +113,7 @@ async function loginEmby(line) {
     const snippet = await bodySnippet(res);
     errors.push(`${identity.client}: HTTP ${res.status}${snippet ? ' | ' + snippet : ''}`);
   }
-  throw new Error(errors.join('；'));
+  throw new Error(`请求地址 ${url} → ${errors.join('；')}`);
 }
 
 /** 拉取资源数量统计（Items/Counts），ua 沿用登录成功时的客户端身份 */
