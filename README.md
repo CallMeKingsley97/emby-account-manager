@@ -16,6 +16,10 @@
 - 详情页可单独测试每条线路的连通性
 - Emby 密码可选 AES-256-GCM 加密存储（配置 `ENCRYPT_KEY`）
 - 可选的访问密码保护（`ACCESS_PASSWORD`）
+- **一键导入到播放器**：详情页可生成带凭据的深链，一键唤起 App 完成服务器导入
+  - 支持：SenPlayer、VidHub、Rex、Hills、Forward、OopsPlayer、EplayerX、小幻影视、Libra
+    （多线路随链接一并导入；Hills/Rex/Forward/VidHub 的协议不含路径参数，带 path 的主线路会提示手动补充）
+  - Infuse / Fileball / AfuseKt / Yamby 暂不支持链接导入（仅提供"复制服务器信息"手动添加）
 
 ## 一键部署
 

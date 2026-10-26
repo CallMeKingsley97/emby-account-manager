@@ -310,7 +310,7 @@ async function handleApi(request, env, url, path) {
   }
 
   // 单个账号
-  const m = path.match(/^\/api\/accounts\/([\w-]+)(\/(refresh|test))?$/);
+  const m = path.match(/^\/api\/accounts\/([\w-]+)(\/(refresh|test|export))?$/);
   if (m) {
     const id = m[1];
     const raw = await env.KV.get(`acct:${id}`);
@@ -406,6 +406,19 @@ async function handleApi(request, env, url, path) {
         }
       }
       return json(results);
+    }
+
+    // 导出账号凭据：用于前端生成播放器一键导入链接（受面板密码保护，密码明文仅此处下发）
+    if (m[3] === 'export' && request.method === 'GET') {
+      const dec = await decryptAccountLines(env, account);
+      return json({
+        name: account.name,
+        note: account.note || '',
+        lines: dec.lines.map(l => ({
+          name: l.name || '', host: l.host, path: l.path || '', port: l.port || '',
+          https: !!l.https, username: l.username || '', password: l.password || '',
+        })),
+      });
     }
 
     return json({ error: '不支持的操作' }, 405);
@@ -647,6 +660,26 @@ const HTML_PAGE = `<!DOCTYPE html>
 
   .sheet-actions { display: flex; gap: 8px; margin-top: 20px; flex-wrap: wrap; }
   .sheet-actions .btn { flex: 1; min-width: 100px; }
+
+  .applist { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; }
+  .appchip {
+    display: flex; align-items: center; gap: 10px; text-align: left;
+    padding: 9px 11px; border: 1px solid var(--sep); border-radius: var(--r-md);
+    background: var(--card); color: var(--text); backdrop-filter: blur(28px) saturate(180%);
+    -webkit-backdrop-filter: blur(28px) saturate(180%);
+    transition: transform .12s ease-out, border-color .2s, background .2s;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .appchip:hover { border-color: color-mix(in srgb, var(--accent) 35%, var(--sep)); }
+  .appchip:active { transform: scale(.96); }
+  .appavatar {
+    width: 34px; height: 34px; border-radius: 9px; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    color: #fff; font-size: 15px; font-weight: 700;
+  }
+  .appmeta { min-width: 0; display: flex; flex-direction: column; }
+  .appmeta b { font-size: 14px; font-weight: 600; letter-spacing: -.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .appmeta i { font-style: normal; font-size: 11.5px; color: var(--text2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .hint { font-size: 12.5px; color: var(--text3); margin: 10px 2px 0; }
   .formmsg { margin-top: 12px; }
   .formmsg .msg { padding: 10px 14px; border-radius: var(--r-sm); font-size: 13px; background: rgba(255,59,48,.1); color: var(--red); word-break: break-all; }
@@ -724,6 +757,8 @@ var ICONS = {
   chevron: '<path d="m9 18 6-6-6-6"/>',
   eye: '<path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"/><circle cx="12" cy="12" r="3"/>',
   eyeoff: '<path d="M10.733 5.076a10.744 10.744 0 0 1 11.205 6.575 1 1 0 0 1 0 .696 10.747 10.747 0 0 1-1.444 2.49"/><path d="M14.084 14.158a3 3 0 0 1-4.242-4.242"/><path d="M17.479 17.499a10.75 10.75 0 0 1-15.417-5.151 1 1 0 0 1 0-.696 10.75 10.75 0 0 1 4.446-5.143"/><path d="m2 2 20 20"/>',
+  copy: '<rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>',
+  import: '<path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/>',
   activity: '<path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"/>'
 };
 function ic(name, cls) {
@@ -738,6 +773,131 @@ var STAT_DEFS = [
   ['disc', '专辑', 'album', '#ff9500'],
   ['book', '图书', 'book', '#30b0c7']
 ];
+
+// ---------- 播放器一键导入 ----------
+// 格式来源：各 App 官方文档 + 社区开源实现交叉验证（timjuly/libra、Aetrix-Emby-Portal）。
+// Infuse / Fileball / AfuseKt / Yamby 已查证不支持链接导入，用复制兜底。
+function lineUrl(l) {
+  return (l.https ? 'https://' : 'http://') + l.host + (l.port ? ':' + l.port : '') + (l.path || '');
+}
+function enc(s) { return encodeURIComponent(s || ''); }
+function b64url(s) {
+  var bin = '';
+  new TextEncoder().encode(s).forEach(function(b) { bin += String.fromCharCode(b); });
+  return btoa(bin).split('+').join('-').split('/').join('_').split('=').join('');
+}
+
+function hostParams(l, p) {
+  p.set('scheme', l.https ? 'https' : 'http');
+  p.set('host', l.host);
+  p.set('port', String(l.port || (l.https ? 443 : 80)));
+}
+function lineParams(a, p) {
+  for (var i = 1; i < a.lines.length; i++) {
+    p.set('line' + i, lineUrl(a.lines[i]));
+    p.set('line' + i + 'title', a.lines[i].name || ('线路' + (i + 1)));
+  }
+}
+function credParams(l, p) {
+  p.set('username', l.username);
+  if (l.password) p.set('password', l.password);
+}
+
+var IMPORT_APPS = [
+  { id: 'senplayer', name: 'SenPlayer', plat: 'iOS · Mac · TV', color: '#ff9500',
+    build: function(a) {
+      var p = new URLSearchParams(); var m = a.lines[0];
+      p.set('type', 'emby'); p.set('name', a.name); if (a.note) p.set('note', a.note);
+      p.set('address', lineUrl(m)); credParams(m, p);
+      for (var i = 1; i < a.lines.length; i++) {
+        p.set('address' + i, lineUrl(a.lines[i]));
+        p.set('address' + i + 'name', a.lines[i].name || ('线路' + (i + 1)));
+      }
+      return 'senplayer://importserver?' + p.toString();
+    } },
+  { id: 'vidhub', name: 'VidHub', plat: '全平台', color: '#0a84ff',
+    build: function(a) {
+      var p = new URLSearchParams(); var m = a.lines[0];
+      p.set('type', 'emby'); p.set('title', a.name); hostParams(m, p); credParams(m, p); lineParams(a, p);
+      return 'vidhub://import?' + p.toString();
+    } },
+  { id: 'rex', name: 'Rex', plat: 'Android', color: '#5e5ce6',
+    build: function(a) {
+      var p = new URLSearchParams(); var m = a.lines[0];
+      p.set('type', 'emby'); p.set('title', a.name); hostParams(m, p); credParams(m, p); lineParams(a, p);
+      return 'rex://import?' + p.toString();
+    } },
+  { id: 'hills', name: 'Hills', plat: 'Android · Windows', color: '#34c759',
+    build: function(a) {
+      var p = new URLSearchParams(); var m = a.lines[0];
+      p.set('type', 'emby'); p.set('title', a.name); hostParams(m, p); credParams(m, p); lineParams(a, p);
+      return 'hills://import?' + p.toString();
+    } },
+  { id: 'forward', name: 'Forward', plat: 'iOS · TV', color: '#ff2d55',
+    build: function(a) {
+      var p = new URLSearchParams(); var m = a.lines[0];
+      p.set('type', 'emby'); p.set('title', a.name); hostParams(m, p); credParams(m, p); lineParams(a, p);
+      return 'forward://import?' + p.toString();
+    } },
+  { id: 'oopsplayer', name: 'OopsPlayer', plat: 'iOS', color: '#30b0c7',
+    build: function(a) {
+      var p = new URLSearchParams(); var m = a.lines[0];
+      p.set('type', 'emby'); p.set('name', a.name);
+      p.set('address', lineUrl(m)); credParams(m, p);
+      for (var i = 1; i < a.lines.length; i++) {
+        p.set('address' + i, lineUrl(a.lines[i]));
+        p.set('address' + i + 'name', a.lines[i].name || ('线路' + (i + 1)));
+      }
+      return 'oopsplayer://importserver?' + p.toString();
+    } },
+  { id: 'eplayerx', name: 'EplayerX', plat: 'iOS · Mac', color: '#af52de',
+    build: function(a) {
+      var p = new URLSearchParams(); var m = a.lines[0];
+      p.set('type', 'emby'); p.set('href', lineUrl(m)); p.set('name', a.name); if (a.note) p.set('remark', a.note);
+      credParams(m, p);
+      if (a.lines.length > 1) {
+        p.set('backupHref', a.lines.slice(1).map(function(l) { return lineUrl(l) + ';' + (l.name || ''); }).join(','));
+      }
+      return 'eplayerx://add-or-update?' + p.toString();
+    } },
+  { id: 'rodelplayer', name: '小幻影视', plat: 'Windows', color: '#8e8e93',
+    build: function(a) {
+      var p = new URLSearchParams(); var m = a.lines[0];
+      p.set('type', 'emby'); p.set('title', a.name); hostParams(m, p);
+      if (m.path) p.set('path', m.path);
+      credParams(m, p); lineParams(a, p);
+      return 'rodelplayer://import?' + p.toString();
+    } },
+  { id: 'libra', name: 'Libra', plat: '多平台', color: '#6e6e73',
+    build: function(a) {
+      var m = a.lines[0];
+      var data = {
+        type: 'emby', name: a.name, note: a.note,
+        credentials: { username: m.username, password: m.password },
+        primary: { url: lineUrl(m), name: m.name || '主线路' },
+        alternates: a.lines.slice(1).map(function(l) { return { url: lineUrl(l), name: l.name || '' }; })
+      };
+      return 'libra://import/server?v=1&data=' + b64url(JSON.stringify(data));
+    } }
+];
+
+var NO_IMPORT_APPS = 'Infuse / Fileball / AfuseKt / Yamby';
+
+function importSectionHtml(a) {
+  var chips = IMPORT_APPS.map(function(app) {
+    return '<button class="appchip" data-action="import" data-app="' + app.id + '" data-id="' + a.id + '">' +
+      '<span class="appavatar" style="background:' + app.color + '">' + esc(app.name.charAt(0)) + '</span>' +
+      '<span class="appmeta"><b>' + esc(app.name) + '</b><i>' + esc(app.plat) + '</i></span>' +
+    '</button>';
+  }).join('');
+  return '<h3 class="sec">一键导入到播放器</h3>' +
+    '<div class="applist">' + chips + '</div>' +
+    '<p class="hint">点击唤起对应 App 完成导入（需已安装）；含密码的链接仅在本机传递。' +
+    esc(NO_IMPORT_APPS) + ' 暂不支持链接导入，可复制信息后手动添加。</p>' +
+    '<div class="sheet-actions" style="margin-top:12px">' +
+      '<button class="btn tint" data-action="copyinfo" data-id="' + a.id + '">' + ic('copy', 'ic16') + '复制服务器信息</button>' +
+    '</div>';
+}
 
 var ACCOUNTS = [];
 var editingId = null;
@@ -1037,6 +1197,7 @@ function openDetail(id, keepScroll) {
     '<h3 class="sec">资源数量</h3><div class="tiles">' + tiles + '</div>' +
     '<h3 class="sec">线路</h3><div class="group linestatus">' + lineRows + '</div>' +
     '<p class="hint">测试线路将逐条尝试登录，检查连通性。</p>' +
+    importSectionHtml(a) +
     '<div class="sheet-actions">' +
       '<button class="btn primary" data-action="refresh" data-id="' + a.id + '">' + ic('refresh', 'ic16') + '刷新数据</button>' +
       '<button class="btn tint" data-action="test" data-id="' + a.id + '">' + ic('activity', 'ic16') + '测试线路</button>' +
@@ -1075,6 +1236,48 @@ function toggleEye(btn) {
   btn.innerHTML = ic(show ? 'eyeoff' : 'eye', 'ic16');
 }
 
+// 这些应用的导入协议不支持路径参数，主线路带 path 时提醒手动补充
+var PATH_DROP = { hills: 1, rex: 1, forward: 1, vidhub: 1 };
+
+async function doImport(id, appId) {
+  var app = null;
+  for (var i = 0; i < IMPORT_APPS.length; i++) if (IMPORT_APPS[i].id === appId) app = IMPORT_APPS[i];
+  if (!app) return;
+  try {
+    var a = await api('/api/accounts/' + id + '/export');
+    if (!a.lines || !a.lines.length) { toast('没有可用线路', 'err'); return; }
+    toast('正在打开 ' + app.name + '…若未安装请改用复制');
+    window.location.href = app.build(a);
+    var m = a.lines[0];
+    if (m.path && PATH_DROP[app.id]) {
+      setTimeout(function() {
+        toast(app.name + ' 导入协议不含路径参数，主线路路径「' + m.path + '」请在 App 内手动补充', 'warn');
+      }, 1200);
+    }
+  } catch (e) { toast('导入失败：' + e.message, 'err'); }
+}
+
+async function copyInfo(id) {
+  var NL = String.fromCharCode(10);
+  try {
+    var a = await api('/api/accounts/' + id + '/export');
+    var parts = ['Emby：' + a.name + (a.note ? '（' + a.note + '）' : '')];
+    a.lines.forEach(function(l, i) {
+      parts.push('线路' + (i + 1) + (l.name ? '「' + l.name + '」' : '') + '：' + lineUrl(l));
+      parts.push('用户：' + l.username + (l.password ? '  密码：' + l.password : ''));
+    });
+    var text = parts.join(NL);
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      var ta = document.createElement('textarea');
+      ta.value = text; document.body.appendChild(ta); ta.select();
+      document.execCommand('copy'); ta.remove();
+    }
+    toast('已复制服务器信息');
+  } catch (e) { toast('复制失败：' + e.message, 'err'); }
+}
+
 // ---------- 事件 ----------
 document.addEventListener('click', function(e) {
   var ov = e.target.classList && e.target.classList.contains('overlay') ? e.target : null;
@@ -1087,6 +1290,8 @@ document.addEventListener('click', function(e) {
     else if (action === 'del') del(id);
     else if (action === 'test') testLines(id);
     else if (action === 'eye') toggleEye(act);
+    else if (action === 'import') doImport(id, act.getAttribute('data-app'));
+    else if (action === 'copyinfo') copyInfo(id);
     else if (action === 'delline') { act.closest('.line').remove(); renumberLines(); }
     return;
   }
