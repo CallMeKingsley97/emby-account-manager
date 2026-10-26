@@ -238,6 +238,11 @@ export default {
       }
     }
 
+    // 临时诊断页：SenPlayer 导入格式排查（无敏感数据，放在鉴权前方便手机直接打开）
+    if (path === '/import-debug') {
+      return new Response(DEBUG_PAGE, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+    }
+
     // 静态页面
     if (path === '/' || path === '/index.html') {
       return new Response(HTML_PAGE, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
@@ -1326,3 +1331,61 @@ loadAccounts();
 </body>
 </html>
 `;
+
+// SenPlayer 导入格式诊断页（临时）
+const DEBUG_PAGE = `<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SenPlayer 导入调试</title>
+<style>
+  body { font: 16px/1.6 -apple-system, system-ui, sans-serif; background: #f2f2f7; color: #1c1c1e; margin: 0; padding: 24px 16px 48px; }
+  .wrap { max-width: 640px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 12px; }
+  p.tip { background: #eef4ff; border-radius: 12px; padding: 12px 14px; font-size: 14px; color: #3a3a3c; margin: 0 0 4px; }
+  .target { font-size: 14px; color: #6e6e73; margin: 10px 0 0; }
+  .card { background: #fff; border-radius: 14px; padding: 14px 16px; margin: 12px 0; box-shadow: 0 1px 2px rgba(0,0,0,.06); }
+  .card h2 { font-size: 16px; margin: 0 0 4px; }
+  code { display: block; font: 12px/1.5 ui-monospace, Menlo, monospace; color: #6e6e73; word-break: break-all; background: #f2f2f7; border-radius: 8px; padding: 8px 10px; margin: 8px 0; }
+  a.btn { display: block; text-align: center; background: #ff9500; color: #fff; text-decoration: none; border-radius: 10px; padding: 10px 0; font-weight: 600; }
+  a.btn:active { opacity: .7; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>SenPlayer 导入格式调试</h1>
+<p class="tip">依次点下面每个按钮，SenPlayer 会弹出导入表单，对照四个字段：<b>主机</b> = test.inemby.us.ci，<b>端口</b> = 443，<b>路径</b> = 空，<b>https</b> = 开。全部正确的变体，把它的编号告诉我。每个变体名字不同（调试A/B/...），方便区分。</p>
+<p class="target">正确目标：主机 test.inemby.us.ci · 端口 443 · 路径 空 · https 开</p>
+
+<div class="card"><h2>A · 完整地址（现行格式，你已测过是错的）</h2>
+<code>address=https://test.inemby.us.ci:443</code>
+<a class="btn" href="senplayer://importserver?type=emby&amp;name=调试A&amp;address=https%3A%2F%2Ftest.inemby.us.ci%3A443&amp;username=test&amp;password=test">导入调试A</a></div>
+
+<div class="card"><h2>B · 无协议带端口</h2>
+<code>address=test.inemby.us.ci:443</code>
+<a class="btn" href="senplayer://importserver?type=emby&amp;name=调试B&amp;address=test.inemby.us.ci%3A443&amp;username=test&amp;password=test">导入调试B</a></div>
+
+<div class="card"><h2>C · 无协议 + 独立 port/https 参数</h2>
+<code>address=test.inemby.us.ci &amp; port=443 &amp; https=true</code>
+<a class="btn" href="senplayer://importserver?type=emby&amp;name=调试C&amp;address=test.inemby.us.ci&amp;port=443&amp;https=true&amp;username=test&amp;password=test">导入调试C</a></div>
+
+<div class="card"><h2>D · 纯独立参数（VidHub 风格）</h2>
+<code>scheme=https &amp; host=test.inemby.us.ci &amp; port=443 &amp; https=true</code>
+<a class="btn" href="senplayer://importserver?type=emby&amp;name=调试D&amp;scheme=https&amp;host=test.inemby.us.ci&amp;port=443&amp;https=true&amp;username=test&amp;password=test">导入调试D</a></div>
+
+<div class="card"><h2>E · 完整地址 + 独立参数组合</h2>
+<code>address=https://test.inemby.us.ci:443 &amp; host=... &amp; port=443 &amp; https=true</code>
+<a class="btn" href="senplayer://importserver?type=emby&amp;name=调试E&amp;address=https%3A%2F%2Ftest.inemby.us.ci%3A443&amp;host=test.inemby.us.ci&amp;port=443&amp;https=true&amp;username=test&amp;password=test">导入调试E</a></div>
+
+<div class="card"><h2>F · 换参数名 url=</h2>
+<code>url=https://test.inemby.us.ci:443</code>
+<a class="btn" href="senplayer://importserver?type=emby&amp;name=调试F&amp;url=https%3A%2F%2Ftest.inemby.us.ci%3A443&amp;username=test&amp;password=test">导入调试F</a></div>
+
+<div class="card"><h2>G · 现行格式 + 备用线路参数（排查备用参数是否干扰）</h2>
+<code>address=... &amp; address1name=备用 &amp; address1=http://test.28.al</code>
+<a class="btn" href="senplayer://importserver?type=emby&amp;name=调试G&amp;address=https%3A%2F%2Ftest.inemby.us.ci%3A443&amp;address1name=%E5%A4%87%E7%94%A8&amp;address1=http%3A%2F%2Ftest.28.al&amp;username=test&amp;password=test">导入调试G</a></div>
+
+</div>
+</body>
+</html>`;
