@@ -111,6 +111,9 @@ async function loginEmby(line) {
     // 401 说明请求已通过客户端过滤、到达认证环节，换身份也没用
     if (res.status === 401) throw new Error('用户名或密码错误');
     const snippet = await bodySnippet(res);
+    if (snippet.includes('emby_login_disabled')) {
+      throw new Error('站点按来源 IP 限制了登录（禁机房/海外 IP）。Cloudflare Workers 的出口是数据中心 IP，无法从本面板登录此线路；请改用该站提供的中转/海外友好线路，或联系站点管理员。');
+    }
     errors.push(`${identity.client}: HTTP ${res.status}${snippet ? ' | ' + snippet : ''}`);
   }
   throw new Error(`请求地址 ${url} → ${errors.join('；')}`);
