@@ -498,6 +498,13 @@ const HTML_PAGE = `<!DOCTYPE html>
   .wrap { position: relative; z-index: 1; max-width: 1020px; margin: 0 auto; padding: clamp(20px, 4vw, 40px) 20px 80px; }
 
   .top { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; margin-bottom: 24px; flex-wrap: wrap; }
+  .top-btns { display: flex; gap: 10px; align-items: center; }
+  .head-balance { width: 52px; display: inline-block; }
+  .sortrow { width: 100%; background: none; border: 0; font: inherit; color: inherit; cursor: pointer; text-align: left; padding: 4px 14px; }
+  .sortrow .row-label { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; }
+  .sortrow:active { background: var(--tint); }
+  .sortstate { margin-left: auto; display: inline-flex; align-items: center; gap: 4px; font-size: 14px; color: var(--accent); font-weight: 500; }
+  .sortstate .ic16 { color: var(--accent); }
   h1 { margin: 0; font-size: 30px; font-weight: 700; letter-spacing: -.02em; line-height: 1.15; }
   .sub { margin: 4px 0 0; color: var(--text2); font-size: 14px; }
 
@@ -706,7 +713,10 @@ const HTML_PAGE = `<!DOCTYPE html>
       <h1>账户</h1>
       <p class="sub" id="summary"></p>
     </div>
-    <button class="btn primary" id="btnAdd"></button>
+    <div class="top-btns">
+      <button class="btn tint" id="btnSort" aria-label="排序方式"></button>
+      <button class="btn primary" id="btnAdd"></button>
+    </div>
   </header>
   <section id="list" class="grid"></section>
 </main>
@@ -729,6 +739,20 @@ const HTML_PAGE = `<!DOCTYPE html>
       <div id="lines"></div>
       <button type="button" class="addline btn" id="btnAddLine"></button>
       <div class="formmsg" id="formMsg"></div>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="sortOverlay" hidden>
+  <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="sortTitle">
+    <header class="sheet-head">
+      <button class="btn ghost" id="btnSortClose">关闭</button>
+      <h2 id="sortTitle">排序方式</h2>
+      <span class="head-balance"></span>
+    </header>
+    <div class="sheet-body">
+      <div class="group" id="sortList"></div>
+      <p class="hint" style="margin-top:10px">点其他项切换排序维度；再点当前项切换正序/倒序。无数据的账户始终排在最后。</p>
     </div>
   </div>
 </div>
@@ -764,7 +788,9 @@ var ICONS = {
   eyeoff: '<path d="M10.733 5.076a10.744 10.744 0 0 1 11.205 6.575 1 1 0 0 1 0 .696 10.747 10.747 0 0 1-1.444 2.49"/><path d="M14.084 14.158a3 3 0 0 1-4.242-4.242"/><path d="M17.479 17.499a10.75 10.75 0 0 1-15.417-5.151 1 1 0 0 1 0-.696 10.75 10.75 0 0 1 4.446-5.143"/><path d="m2 2 20 20"/>',
   copy: '<rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>',
   import: '<path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/>',
-  activity: '<path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"/>'
+  activity: '<path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"/>',
+  check: '<polyline points="20 6 9 17 4 12"/>',
+  sort: '<path d="m3 16 4 4 4-4"/><path d="M7 20V4"/><path d="m21 8-4-4-4 4"/><path d="M17 4v16"/>'
 };
 function ic(name, cls) {
   return '<svg class="' + (cls || '') + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + ICONS[name] + '</svg>';
@@ -907,6 +933,80 @@ function importSectionHtml(a) {
 var ACCOUNTS = [];
 var editingId = null;
 
+// ---------- 排序 ----------
+var SORT_DEFS = [
+  ['recent', '最近观看', 'clock', 'desc'],
+  ['movie', '电影', 'film', 'desc'],
+  ['series', '剧集', 'tv', 'desc'],
+  ['episode', '集数', 'layers', 'desc'],
+  ['song', '歌曲', 'music', 'desc'],
+  ['album', '专辑', 'disc', 'desc'],
+  ['book', '图书', 'book', 'desc'],
+  ['name', '名称', 'server', 'asc']
+];
+var SORT = (function() {
+  try {
+    var s = JSON.parse(localStorage.getItem('emby-sort') || 'null');
+    if (s && s.key && (s.dir === 'asc' || s.dir === 'desc')) return s;
+  } catch (_) {}
+  return { key: 'recent', dir: 'desc' };
+})();
+function saveSort() { try { localStorage.setItem('emby-sort', JSON.stringify(SORT)); } catch (_) {} }
+
+function sortVal(a, key) {
+  if (key === 'name') return String(a.name || '');
+  if (key === 'recent') return a.lastWatchedAt ? new Date(a.lastWatchedAt).getTime() : null;
+  var v = (a.counts || {})[key];
+  return (v === undefined || v === null) ? null : v;
+}
+function sortAccounts(list) {
+  var mul = SORT.dir === 'asc' ? 1 : -1;
+  var sec = function(x) { return Date.parse(x.lastWatchedAt) || 0; };
+  return list.slice().sort(function(a, b) {
+    var va = sortVal(a, SORT.key), vb = sortVal(b, SORT.key);
+    if (SORT.key === 'name') return String(va).localeCompare(String(vb), 'zh-Hans-CN') * mul;
+    if (va === null && vb === null) return sec(b) - sec(a);
+    if (va === null) return 1;  // 无数据始终排最后
+    if (vb === null) return -1;
+    if (va === vb) return sec(b) - sec(a);  // 并列时按最近观看
+    return (va - vb) * mul;
+  });
+}
+function sortDef(key) {
+  for (var i = 0; i < SORT_DEFS.length; i++) if (SORT_DEFS[i][0] === key) return SORT_DEFS[i];
+  return null;
+}
+function dirLabel(key, dir) {
+  if (key === 'recent') return dir === 'desc' ? '从新到旧' : '从旧到新';
+  if (key === 'name') return dir === 'asc' ? 'A 到 Z' : 'Z 到 A';
+  return dir === 'desc' ? '从多到少' : '从少到多';
+}
+function updateSortBtn() {
+  var d = sortDef(SORT.key);
+  $('#btnSort').innerHTML = ic('sort', 'ic16') + (d ? d[1] : '排序') + ' ' + (SORT.dir === 'desc' ? '↓' : '↑');
+}
+function renderSortMenu() {
+  $('#sortList').innerHTML = SORT_DEFS.map(function(d) {
+    var on = SORT.key === d[0];
+    return '<button class="row sortrow" data-skey="' + d[0] + '">' +
+      '<span class="row-label">' + ic(d[2], 'ic16') + d[1] + '</span>' +
+      (on ? '<span class="sortstate">' + dirLabel(d[0], SORT.dir) + ic('check', 'ic16') + '</span>' : '') +
+    '</button>';
+  }).join('');
+}
+function openSort() { renderSortMenu(); openOverlay($('#sortOverlay')); }
+function pickSort(key) {
+  if (SORT.key === key) {
+    SORT.dir = SORT.dir === 'asc' ? 'desc' : 'asc';
+    saveSort(); renderSortMenu(); render(); updateSortBtn();
+    return;  // 切方向时保持菜单打开，方便确认状态
+  }
+  var d = sortDef(key);
+  SORT.key = key; SORT.dir = d ? d[3] : 'desc';
+  saveSort(); render(); updateSortBtn();
+  closeOverlay($('#sortOverlay'));
+}
+
 function $(s) { return document.querySelector(s); }
 
 function esc(s) {
@@ -975,7 +1075,7 @@ function render() {
       '<button class="btn primary" id="btnEmptyAdd">' + ic('plus', 'ic16') + '添加账户</button></div>';
     return;
   }
-  el.innerHTML = ACCOUNTS.map(cardHtml).join('');
+  el.innerHTML = sortAccounts(ACCOUNTS).map(cardHtml).join('');
 }
 
 function chip(icon, n, label) {
@@ -1301,6 +1401,10 @@ document.addEventListener('click', function(e) {
     return;
   }
   if (e.target.closest('#btnAdd') || e.target.closest('#btnEmptyAdd')) { openAdd(); return; }
+  if (e.target.closest('#btnSort')) { openSort(); return; }
+  if (e.target.closest('#btnSortClose')) { closeOverlay($('#sortOverlay')); return; }
+  var srow = e.target.closest('[data-skey]');
+  if (srow) { pickSort(srow.getAttribute('data-skey')); return; }
   if (e.target.closest('#btnSave')) { save(); return; }
   if (e.target.closest('#btnCancel')) { closeOverlay($('#editOverlay')); return; }
   if (e.target.closest('#btnDetailClose')) { closeOverlay($('#detailOverlay')); return; }
@@ -1324,6 +1428,7 @@ document.addEventListener('keydown', function(e) {
 function initChrome() {
   $('#btnAdd').innerHTML = ic('plus', 'ic16') + '添加账户';
   $('#btnAddLine').innerHTML = ic('plus', 'ic16') + '添加备用线路';
+  updateSortBtn();
 }
 initChrome();
 loadAccounts();
