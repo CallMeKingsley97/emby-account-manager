@@ -6,6 +6,13 @@ compatibility_date = "2024-12-01"
 [[kv_namespaces]]
 binding = "KV"
 
+# 定时巡检：每小时触发一次。是否启用、每个账号的检查间隔、每次检查数量都在面板「设置」中控制，
+# 默认关闭；关闭时只读 KV，不访问任何 Emby 服务器。
+[triggers]
+crons = ["0 * * * *"]
+
 # 可选配置（部署后在 Worker 的 Settings → Variables and Secrets 中添加，均可留空）：
 #   ACCESS_PASSWORD  面板访问密码；不设置则无需密码
 #   ENCRYPT_KEY      Emby 密码加密密钥（`openssl rand -hex 32` 生成）；不设置则明文存储
+#   TG_BOT_TOKEN + TG_CHAT_ID   巡检异常推送到 Telegram
+#   BARK_URL         巡检异常推送到 Bark，形如 https://api.day.app/<key>

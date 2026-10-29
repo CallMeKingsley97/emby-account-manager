@@ -5,7 +5,12 @@
  * {
  *   id, name, note,
  *   lines: [{ name, host, path, port, https, username, password }],  // 主线路为 lines[0]
- *   userId, token,          // 登录成功后缓存（主线路的）
+ *   userId, token, client,  // 登录成功后缓存的会话（client 为命中的客户端身份）
+ *   serverId, server: { name, version },
+ *   activeLine,             // 当前使用的线路下标
+ *   lineStats: [{ ok, ms, error, checkedAt }],  // 各线路延迟（从 Cloudflare 测得）
+ *   user: { isDisabled },
+ *   health: { ok, error, checkedAt },           // 最近一次刷新/巡检结果
  *   lastWatchedAt,          // 最近一次观看时间
  *   counts: { movie, series, episode, song, ... },
  *   updatedAt
@@ -79,12 +84,75 @@ async function bodySnippet(res) {
   } catch (_) { return ''; }
 }
 
-/** 登录 Emby，返回 { userId, token, serverId, identity }；失败抛错 */
-async function loginEmby(line) {
+const DEVICE_ID = 'emby-manager-cf';
+
+/** 按缓存的 client 名取身份，找不到用第一个 */
+function identityOf(client) {
+  return CLIENT_IDENTITIES.find(i => i.client === client) || CLIENT_IDENTITIES[0];
+}
+
+/** Workers 子请求数超限：不能当成"服务器连不上"，要原样抛出 */
+function isSubrequestLimit(e) {
+  return /subrequest/i.test((e && e.message) || '');
+}
+
+function networkError(e, base) {
+  if (isSubrequestLimit(e)) return e;
+  return new Error(`无法连接服务器 ${base}（超时或网络错误）`);
+}
+
+/** 带 token 的 GET，返回 JSON；HTTP 错误带 status，网络错误带 network 标记 */
+async function embyGet(base, path, token, ua) {
+  const sep = path.includes('?') ? '&' : '?';
+  let res;
+  try {
+    res = await embyFetch(base, `${path}${sep}api_key=${encodeURIComponent(token)}`, { headers: { 'User-Agent': ua } });
+  } catch (e) {
+    const err = networkError(e, base);
+    err.network = !isSubrequestLimit(e);
+    throw err;
+  }
+  if (!res.ok) {
+    const err = new Error(`HTTP ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
+  return res.json();
+}
+
+/** 探测线路：无需登录的 System/Info/Public，顺带拿服务器名/版本/ID 和延迟 */
+async function probeLine(line) {
+  const base = buildBaseUrl(line);
+  const t0 = Date.now();
+  let res;
+  try {
+    res = await embyFetch(base, '/emby/System/Info/Public', {}, 8000);
+  } catch (e) {
+    if (isSubrequestLimit(e)) throw e;
+    return { ok: false, error: '超时或网络错误' };
+  }
+  const ms = Date.now() - t0;
+  if (!res.ok) return { ok: false, ms, error: `HTTP ${res.status}` };
+  const d = await res.json().catch(() => null);
+  if (!d) return { ok: false, ms, error: '响应不是 Emby 接口' };
+  return { ok: true, ms, info: { id: d.Id || '', name: d.ServerName || '', version: d.Version || '' } };
+}
+
+/** 账号状态：Policy.IsDisabled（被服主禁用时为 true） */
+async function fetchUserStatus(base, token, userId, ua) {
+  const u = await embyGet(base, `/emby/Users/${encodeURIComponent(userId)}`, token, ua);
+  return { isDisabled: !!(u.Policy && u.Policy.IsDisabled) };
+}
+
+/** 登录 Emby，返回 { userId, token, serverId, identity }；失败抛错。preferClient 命中的身份优先尝试 */
+async function loginEmby(line, preferClient) {
   const base = buildBaseUrl(line);
   const url = `${base}/emby/Users/AuthenticateByName`;
   const errors = [];
-  for (const identity of CLIENT_IDENTITIES) {
+  const identities = preferClient
+    ? [identityOf(preferClient), ...CLIENT_IDENTITIES.filter(i => i.client !== preferClient)]
+    : CLIENT_IDENTITIES;
+  for (const identity of identities) {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 12000);
     let res;
@@ -95,12 +163,12 @@ async function loginEmby(line) {
         headers: {
           'Content-Type': 'application/json',
           'User-Agent': identity.ua,
-          'X-Emby-Authorization': `MediaBrowser Client="${identity.client}", Device="${identity.device}", DeviceId="emby-manager-cf", Version="${identity.version}"`,
+          'X-Emby-Authorization': `MediaBrowser Client="${identity.client}", Device="${identity.device}", DeviceId="${DEVICE_ID}", Version="${identity.version}"`,
         },
         body: JSON.stringify({ Username: line.username, Pw: line.password || '' }),
       });
     } catch (e) {
-      throw new Error(`无法连接服务器 ${base}（超时或网络错误）`);
+      throw networkError(e, base);
     } finally {
       clearTimeout(timer);
     }
@@ -179,6 +247,7 @@ function cryptoKeyCache(env) {
 
 async function encryptPassword(env, plain) {
   if (!plain) return '';
+  if (plain.startsWith(ENC_PREFIX)) return plain; // 已是密文，防止重复加密
   const key = cryptoKeyCache(env);
   if (!key) return plain; // 未配置 ENCRYPT_KEY，保持明文
   const iv = crypto.getRandomValues(new Uint8Array(12));
@@ -196,10 +265,11 @@ async function decryptPassword(env, stored) {
   if (!key) throw new Error('检测到加密数据但未配置 ENCRYPT_KEY');
   const [, , ivB64, cipherB64] = stored.split(':');
   const dec = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
-  const plain = await crypto.subtle.decrypt(
+  const plain = new TextDecoder().decode(await crypto.subtle.decrypt(
     { name: 'AES-GCM', iv: dec(ivB64) }, await key, dec(cipherB64)
-  );
-  return new TextDecoder().decode(plain);
+  ));
+  // 旧版本刷新时会把密文再加密一次，这里逐层解开
+  return plain.startsWith(ENC_PREFIX) ? decryptPassword(env, plain) : plain;
 }
 
 /** 解密账号对象中所有线路的密码，返回新对象 */
@@ -216,6 +286,274 @@ async function encryptAccountLines(env, account) {
     ...l, password: await encryptPassword(env, l.password),
   })));
   return { ...account, lines };
+}
+
+// ---------- 刷新 / 会话 ----------
+
+/**
+ * 刷新账号数据，直接修改 account（KV 中的原始对象，密码保持密文）。
+ * - 优先复用缓存 token，失效才重新登录（减少登录记录与子请求）
+ * - measure: 先并行探测所有线路，按延迟选线路；否则从 activeLine 开始依次尝试
+ * - forceLogin: 编辑后密码可能改了，必须重新登录验证
+ * 全部失败时写入 health 并抛错。
+ */
+async function refreshAccount(env, account, { measure = false, forceLogin = false } = {}) {
+  const dec = await decryptAccountLines(env, account);
+  const n = dec.lines.length;
+  let order = dec.lines.map((_, i) => i);
+  const active = account.activeLine < n ? account.activeLine : 0;
+  order = [active, ...order.filter(i => i !== active)];
+
+  let probes = null;
+  if (measure) {
+    probes = await Promise.all(dec.lines.map(probeLine));
+    const now = new Date().toISOString();
+    account.lineStats = probes.map(p => ({ ok: p.ok, ms: p.ms ?? null, error: p.error || '', checkedAt: now }));
+    // 能连通的按延迟升序，不通的放最后（仍会尝试，探测失败不代表登录一定失败）
+    const key = i => (probes[i].ok ? probes[i].ms : 1e9);
+    order = dec.lines.map((_, i) => i).sort((a, b) => key(a) - key(b));
+  }
+
+  const errors = [];
+  for (const idx of order) {
+    const line = dec.lines[idx];
+    const base = buildBaseUrl(line);
+    try {
+      let session = null, user = null;
+      if (!forceLogin && account.token && account.userId) {
+        const ua = identityOf(account.client).ua;
+        try {
+          user = await fetchUserStatus(base, account.token, account.userId, ua);
+          session = { token: account.token, userId: account.userId, client: account.client, ua };
+        } catch (e) {
+          if (e.network || isSubrequestLimit(e)) throw e; // 线路不通，换下一条
+          // 有 HTTP 响应（token 过期 / 被拒）→ 下面重新登录
+        }
+      }
+      if (!session) {
+        const login = await loginEmby(line, account.client);
+        session = { token: login.token, userId: login.userId, client: login.identity.client, ua: login.identity.ua, serverId: login.serverId };
+        user = await fetchUserStatus(base, session.token, session.userId, session.ua).catch(e => {
+          if (isSubrequestLimit(e)) throw e;
+          return null;
+        });
+      }
+
+      const soft = p => p.catch(e => { if (isSubrequestLimit(e)) throw e; return null; });
+      const needProbe = !probes && !account.server;
+      const [counts, lastPlayed, probe] = await Promise.all([
+        soft(fetchCounts(base, session.token, session.ua)),
+        soft(fetchLastPlayed(base, session.token, session.userId, session.ua)),
+        needProbe ? soft(probeLine(line)) : Promise.resolve(probes ? probes[idx] : null),
+      ]);
+
+      Object.assign(account, {
+        userId: session.userId, token: session.token, client: session.client,
+        activeLine: idx,
+        health: { ok: true, error: '', checkedAt: new Date().toISOString() },
+        updatedAt: new Date().toISOString(),
+      });
+      if (session.serverId) account.serverId = session.serverId;
+      if (user) account.user = user;
+      if (counts) account.counts = counts;
+      // 拉取失败时保留旧值；成功但没有记录才清空
+      if (lastPlayed) {
+        account.lastWatchedAt = lastPlayed.lastWatchedAt || null;
+        account.lastWatchedName = lastPlayed.lastWatchedName || '';
+      }
+      if (probe && probe.ok) {
+        account.server = { name: probe.info.name, version: probe.info.version };
+        if (probe.info.id) account.serverId = probe.info.id;
+      }
+      return account;
+    } catch (e) {
+      if (isSubrequestLimit(e)) throw e;
+      errors.push(`${line.name || line.host}: ${e.message}`);
+    }
+  }
+  account.health = { ok: false, error: errors.join('；') || '没有可用线路', checkedAt: new Date().toISOString() };
+  throw new Error(account.health.error);
+}
+
+/** 用缓存会话调用 fn(base, token, userId, ua)；token 失效（401）时重新登录一次并回写 KV */
+async function withSession(env, account, fn) {
+  const dec = await decryptAccountLines(env, account);
+  const idx = account.activeLine < dec.lines.length ? account.activeLine : 0;
+  const line = dec.lines[idx];
+  const base = buildBaseUrl(line);
+  if (account.token && account.userId) {
+    try {
+      return await fn(base, account.token, account.userId, identityOf(account.client).ua);
+    } catch (e) {
+      if (e.status !== 401) throw e;
+    }
+  }
+  const login = await loginEmby(line, account.client);
+  Object.assign(account, { token: login.token, userId: login.userId, client: login.identity.client });
+  await env.KV.put(`acct:${account.id}`, JSON.stringify(account));
+  return fn(base, login.token, login.userId, login.identity.ua);
+}
+
+/** 精简条目字段，只留前端展示需要的 */
+function slimItem(it) {
+  const ud = it.UserData || {};
+  return {
+    name: it.Name || '', type: it.Type || '', series: it.SeriesName || '',
+    season: it.ParentIndexNumber ?? null, episode: it.IndexNumber ?? null,
+    year: it.ProductionYear || null,
+    percent: ud.PlayedPercentage ? Math.round(ud.PlayedPercentage) : null,
+    lastPlayed: ud.LastPlayedDate || null,
+    childCount: it.ChildCount || null,
+  };
+}
+
+/** 详情页实时内容：在线会话 / 继续观看 / 下一集 / 最近入库 / 收藏 / 媒体库 */
+async function fetchContent(base, token, userId, ua) {
+  const uid = encodeURIComponent(userId);
+  const F = 'Fields=UserData,ProductionYear&EnableImages=false';
+  const calls = {
+    views: embyGet(base, `/emby/Users/${uid}/Views`, token, ua),
+    resume: embyGet(base, `/emby/Users/${uid}/Items/Resume?Limit=10&MediaTypes=Video&${F}`, token, ua),
+    nextUp: embyGet(base, `/emby/Shows/NextUp?UserId=${uid}&Limit=10&${F}`, token, ua),
+    latest: embyGet(base, `/emby/Users/${uid}/Items/Latest?Limit=12&GroupItems=true&${F}`, token, ua),
+    favorites: embyGet(base, `/emby/Users/${uid}/Items?Filters=IsFavorite&Recursive=true&IncludeItemTypes=Movie,Series&SortBy=SortName&Limit=20&${F}`, token, ua),
+    sessions: embyGet(base, `/emby/Sessions`, token, ua),
+  };
+  const keys = Object.keys(calls);
+  const settled = await Promise.allSettled(keys.map(k => calls[k]));
+  // Views 任何用户都能访问：它 401 说明 token 失效，交给 withSession 重新登录
+  if (settled[0].status === 'rejected' && settled[0].reason.status === 401) throw settled[0].reason;
+
+  const out = {};
+  keys.forEach((k, i) => {
+    const r = settled[i];
+    if (r.status === 'rejected') { out[k] = { error: r.reason.message }; return; }
+    const v = r.value;
+    const items = Array.isArray(v) ? v : (v.Items || []);
+    if (k === 'views') {
+      out[k] = items.map(x => ({ name: x.Name || '', type: x.CollectionType || '' }));
+    } else if (k === 'sessions') {
+      // 非管理员通常只能看到自己的会话；管理员能看到全部，按 UserId 过滤。排除本面板自身
+      out[k] = items
+        .filter(s => s.UserId === userId && s.DeviceId !== DEVICE_ID)
+        .map(s => ({
+          device: s.DeviceName || '', client: s.Client || '', ip: s.RemoteEndPoint || '',
+          lastActivity: s.LastActivityDate || null,
+          playing: s.NowPlayingItem ? slimItem(s.NowPlayingItem) : null,
+          paused: !!(s.PlayState && s.PlayState.IsPaused),
+        }));
+    } else {
+      out[k] = items.map(slimItem);
+    }
+  });
+  return out;
+}
+
+// ---------- 定时巡检 + 通知 ----------
+
+async function notify(env, title, text) {
+  const tasks = [];
+  if (env.TG_BOT_TOKEN && env.TG_CHAT_ID) {
+    tasks.push(fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: env.TG_CHAT_ID, text: `${title}\n\n${text}`, disable_web_page_preview: true }),
+    }).then(async r => { if (!r.ok) throw new Error(`Telegram HTTP ${r.status} ${await bodySnippet(r)}`); }));
+  }
+  if (env.BARK_URL) {
+    // BARK_URL 形如 https://api.day.app/<key>
+    tasks.push(fetch(env.BARK_URL.replace(/\/+$/, ''), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title, body: text, group: 'Emby' }),
+    }).then(async r => { if (!r.ok) throw new Error(`Bark HTTP ${r.status} ${await bodySnippet(r)}`); }));
+  }
+  if (!tasks.length) return { sent: 0 };
+  const rs = await Promise.allSettled(tasks);
+  const errs = rs.filter(r => r.status === 'rejected').map(r => r.reason.message);
+  if (errs.length) throw new Error(errs.join('；'));
+  return { sent: tasks.length };
+}
+
+/** 状态变化才提醒，避免每次巡检重复推送 */
+function healthAlert(prev, a) {
+  const name = a.name || a.id;
+  const wasOk = !prev.health || prev.health.ok !== false;
+  if (wasOk && a.health && !a.health.ok) return `❌ ${name}：所有线路不可用\n${String(a.health.error).slice(0, 200)}`;
+  if (!wasOk && a.health && a.health.ok) return `✅ ${name}：已恢复`;
+  const wasDisabled = !!(prev.user && prev.user.isDisabled);
+  if (!wasDisabled && a.user && a.user.isDisabled) return `⛔ ${name}：账号已被服务器禁用`;
+  return null;
+}
+
+// ---------- 面板设置（KV: settings，页面可改） ----------
+const DEFAULT_SETTINGS = {
+  cronEnabled: false,       // 自动巡检，默认关闭
+  checkIntervalHours: 24,   // 同一账号两次巡检的最短间隔（手动刷新也算一次检查）
+  cronBatch: 3,             // 每次触发最多检查几个账号
+  autoLoadContent: false,   // 打开详情页时自动拉取实时内容
+  inactiveDays: 30,         // 超过多少天未观看提示
+};
+const INTERVAL_OPTIONS = [6, 12, 24, 48, 72, 168];
+
+async function getSettings(env) {
+  const s = await env.KV.get('settings', 'json').catch(() => null);
+  return { ...DEFAULT_SETTINGS, ...(s || {}) };
+}
+
+/** 校验并钳制页面提交的设置，未知字段丢弃 */
+function sanitizeSettings(body, cur) {
+  const int = (v, min, max, def) => {
+    const n = parseInt(v, 10);
+    return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : def;
+  };
+  const hours = int(body.checkIntervalHours, 6, 168, cur.checkIntervalHours);
+  return {
+    cronEnabled: typeof body.cronEnabled === 'boolean' ? body.cronEnabled : cur.cronEnabled,
+    checkIntervalHours: INTERVAL_OPTIONS.includes(hours) ? hours : cur.checkIntervalHours,
+    cronBatch: int(body.cronBatch, 1, 5, cur.cronBatch),
+    autoLoadContent: typeof body.autoLoadContent === 'boolean' ? body.autoLoadContent : cur.autoLoadContent,
+    inactiveDays: int(body.inactiveDays, 1, 3650, cur.inactiveDays),
+  };
+}
+
+/**
+ * Cron 每小时触发一次，但只检查"距上次检查超过间隔"的账号，按最久未检查优先，
+ * 每次最多 cronBatch 个。关闭巡检时不访问任何 Emby 服务器。
+ */
+async function runScheduledCheck(env) {
+  const settings = await getSettings(env);
+  if (!settings.cronEnabled) return;
+  const ids = JSON.parse((await env.KV.get('index:accounts')) || '[]');
+  if (!ids.length) return;
+  const accounts = (await Promise.all(ids.map(id => env.KV.get(`acct:${id}`, 'json')))).filter(Boolean);
+  const checkedAt = a => Date.parse(a.health && a.health.checkedAt) || 0;
+  const cutoff = Date.now() - settings.checkIntervalHours * 3600 * 1000;
+  const due = accounts.filter(a => checkedAt(a) <= cutoff)
+    .sort((a, b) => checkedAt(a) - checkedAt(b))
+    .slice(0, settings.cronBatch);
+
+  const alerts = [];
+  for (const account of due) {
+    const prev = { health: account.health, user: account.user };
+    try {
+      await refreshAccount(env, account);
+    } catch (e) {
+      if (isSubrequestLimit(e)) break; // 额度用完，剩下的留给下一轮，不算失败
+    }
+    await env.KV.put(`acct:${account.id}`, JSON.stringify(account));
+    const msg = healthAlert(prev, account);
+    if (msg) alerts.push(msg);
+  }
+  if (alerts.length) {
+    try { await notify(env, 'Emby 账号巡检', alerts.join('\n\n')); } catch (e) { console.error('通知发送失败', e.message); }
+  }
+}
+
+/** 返回给前端时去掉密码和 token */
+function safeAccount(a) {
+  const { token, ...rest } = a;
+  return { ...rest, lines: (a.lines || []).map(l => ({ ...l, password: '' })) };
 }
 
 // ---------- 路由 ----------
@@ -249,6 +587,11 @@ export default {
     }
     return new Response('Not Found', { status: 404 });
   },
+
+  // Cron Trigger：定时巡检（频率见 wrangler.toml 的 [triggers]）
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(runScheduledCheck(env));
+  },
 };
 
 async function handleApi(request, env, url, path) {
@@ -259,7 +602,24 @@ async function handleApi(request, env, url, path) {
     const ids = JSON.parse((await env.KV.get(listKey)) || '[]');
     const accounts = await Promise.all(ids.map(id => env.KV.get(`acct:${id}`, 'json')));
     // 返回时隐藏密码字段
-    return json(accounts.filter(Boolean).map(a => ({ ...a, lines: (a.lines || []).map(l => ({ ...l, password: '' })) })));
+    return json(accounts.filter(Boolean).map(safeAccount));
+  }
+
+  // 面板设置
+  if (path === '/api/settings' && (request.method === 'GET' || request.method === 'PUT')) {
+    let settings = await getSettings(env);
+    if (request.method === 'PUT') {
+      settings = sanitizeSettings(await request.json(), settings);
+      await env.KV.put('settings', JSON.stringify(settings));
+    }
+    return json({ ...settings, notify: !!((env.TG_BOT_TOKEN && env.TG_CHAT_ID) || env.BARK_URL) });
+  }
+
+  // 发送测试通知
+  if (path === '/api/notify/test' && request.method === 'POST') {
+    const r = await notify(env, 'Emby 账号管理器', '这是一条测试通知，收到说明配置正确。');
+    if (!r.sent) return json({ error: '未配置通知渠道（TG_BOT_TOKEN + TG_CHAT_ID 或 BARK_URL）' }, 400);
+    return json({ ok: true, sent: r.sent });
   }
 
   // 添加账号
@@ -268,54 +628,31 @@ async function handleApi(request, env, url, path) {
     const lines = (body.lines || []).filter(l => l.host && l.username);
     if (lines.length === 0) return json({ error: '至少需要一条有效线路（host + username）' }, 400);
 
-    // 逐条线路尝试登录，成功一条即作为主线路
-    let main = null;
-    const lineResults = [];
-    for (const line of lines) {
-      try {
-        const r = await loginEmby(line);
-        if (!main) main = { line, ...r };
-        lineResults.push({ name: line.name || line.host, ok: true });
-      } catch (e) {
-        lineResults.push({ name: line.name || line.host, ok: false, error: e.message });
-      }
-    }
-    if (!main) {
-      const errs = lineResults.map(r => `${r.name}: ${r.error}`).join('；');
-      return json({ error: `所有线路均登录失败 → ${errs}` }, 400);
-    }
-
-    // 拉取初始数据
-    const base = buildBaseUrl(main.line);
-    let counts = null, lastPlayed = {};
-    try { counts = await fetchCounts(base, main.token, main.identity.ua); } catch (_) {}
-    try { lastPlayed = await fetchLastPlayed(base, main.token, main.userId, main.identity.ua); } catch (_) {}
-
     const id = crypto.randomUUID();
     const account = await encryptAccountLines(env, {
       id,
-      name: body.name || main.line.username,
+      name: body.name || lines[0].username,
       note: body.note || '',
       lines: lines.map(l => ({ ...l, password: l.password || '' })),
-      userId: main.userId,
-      token: main.token,
-      serverId: main.serverId,
-      counts: counts || {},
-      lastWatchedAt: lastPlayed.lastWatchedAt || null,
-      lastWatchedName: lastPlayed.lastWatchedName || '',
-      updatedAt: new Date().toISOString(),
+      counts: {},
+      lastWatchedAt: null,
+      lastWatchedName: '',
     });
+    // 测速并逐条登录，成功一条即可保存
+    try {
+      await refreshAccount(env, account, { measure: true, forceLogin: true });
+    } catch (e) {
+      return json({ error: `所有线路均登录失败 → ${e.message}` }, 400);
+    }
     const ids = JSON.parse((await env.KV.get(listKey)) || '[]');
     ids.push(id);
     await env.KV.put(listKey, JSON.stringify(ids));
     await env.KV.put(`acct:${id}`, JSON.stringify(account));
-    // 返回给前端的副本隐藏密码
-    const safe = { ...account, lines: account.lines.map(l => ({ ...l, password: '' })) };
-    return json({ account: safe, lineResults });
+    return json({ account: safeAccount(account) });
   }
 
   // 单个账号
-  const m = path.match(/^\/api\/accounts\/([\w-]+)(\/(refresh|test|export))?$/);
+  const m = path.match(/^\/api\/accounts\/([\w-]+)(\/(refresh|test|export|content))?$/);
   if (m) {
     const id = m[1];
     const raw = await env.KV.get(`acct:${id}`);
@@ -342,75 +679,47 @@ async function handleApi(request, env, url, path) {
 
       account.name = (body.name || '').trim() || account.name;
       account.note = (body.note || '').trim();
+      account.lines = (await encryptAccountLines(env, { lines: merged })).lines;
+      if (!(account.activeLine < merged.length)) account.activeLine = 0;
 
-      // 用新配置尝试登录并刷新数据（失败不阻塞保存，编辑本身一定生效）
-      let loginOk = false, loginErr = null;
-      for (const line of merged) {
-        try {
-          const login = await loginEmby(line);
-          const base = buildBaseUrl(line);
-          let counts = null, lastPlayed = {};
-          try { counts = await fetchCounts(base, login.token, login.identity.ua); } catch (_) {}
-          try { lastPlayed = await fetchLastPlayed(base, login.token, login.userId, login.identity.ua); } catch (_) {}
-          Object.assign(account, {
-            userId: login.userId, token: login.token, serverId: login.serverId,
-            counts: counts || account.counts || {},
-            lastWatchedAt: lastPlayed.lastWatchedAt || null,
-            lastWatchedName: lastPlayed.lastWatchedName || '',
-          });
-          loginOk = true;
-          break;
-        } catch (e) { loginErr = e.message; }
-      }
+      // 用新配置重新登录并刷新数据（失败不阻塞保存，编辑本身一定生效）
+      let loginOk = true, loginErr;
+      try {
+        await refreshAccount(env, account, { measure: true, forceLogin: true });
+      } catch (e) { loginOk = false; loginErr = e.message; }
 
-      account.lines = merged;
       account.updatedAt = new Date().toISOString();
-      await env.KV.put(`acct:${id}`, JSON.stringify(await encryptAccountLines(env, account)));
-      const safe = { ...account, lines: account.lines.map(l => ({ ...l, password: '' })) };
-      return json({ ok: true, loginOk, error: loginOk ? undefined : loginErr, account: safe });
+      await env.KV.put(`acct:${id}`, JSON.stringify(account));
+      return json({ ok: true, loginOk, error: loginErr, account: safeAccount(account) });
     }
 
-    // 刷新：重新登录可用线路，更新观看时间与资源数量
+    // 刷新：测速选线路，复用/刷新会话，更新状态、观看时间与资源数量
     if (m[3] === 'refresh' && request.method === 'POST') {
-      const dec = await decryptAccountLines(env, account);
-      let result = null, lastErr = null;
-      for (const line of dec.lines) {
-        try {
-          const login = await loginEmby(line);
-          const base = buildBaseUrl(line);
-          let counts = null, lastPlayed = {};
-          try { counts = await fetchCounts(base, login.token, login.identity.ua); } catch (_) {}
-          try { lastPlayed = await fetchLastPlayed(base, login.token, login.userId, login.identity.ua); } catch (_) {}
-          result = {
-            userId: login.userId, token: login.token, serverId: login.serverId,
-            counts: counts || account.counts || {},
-            lastWatchedAt: lastPlayed.lastWatchedAt || null,
-            lastWatchedName: lastPlayed.lastWatchedName || '',
-            viaLine: line.name || line.host,
-          };
-          break; // 第一条可用线路成功即停
-        } catch (e) { lastErr = e; }
-      }
-      if (!result) return json({ error: `刷新失败：${lastErr ? lastErr.message : '所有线路不可用'}` }, 502);
-      Object.assign(account, result, { updatedAt: new Date().toISOString() });
-      delete account.viaLine;
-      await env.KV.put(`acct:${id}`, JSON.stringify(await encryptAccountLines(env, account)));
-      return json({ ...account, lines: account.lines.map(l => ({ ...l, password: '' })) });
+      let err = null;
+      try { await refreshAccount(env, account, { measure: true }); } catch (e) { err = e; }
+      await env.KV.put(`acct:${id}`, JSON.stringify(account)); // 失败也记录 health / 延迟
+      if (err) return json({ error: `刷新失败：${err.message}` }, 502);
+      return json(safeAccount(account));
     }
 
-    // 测试所有线路连通性
+    // 测试所有线路：并行登录，记录延迟
     if (m[3] === 'test' && request.method === 'POST') {
       const dec = await decryptAccountLines(env, account);
-      const results = [];
-      for (const line of dec.lines) {
+      const results = await Promise.all(dec.lines.map(async line => {
+        const t0 = Date.now();
         try {
-          await loginEmby(line);
-          results.push({ name: line.name || line.host, ok: true });
+          await loginEmby(line, account.client);
+          return { name: line.name || line.host, ok: true, ms: Date.now() - t0 };
         } catch (e) {
-          results.push({ name: line.name || line.host, ok: false, error: e.message });
+          return { name: line.name || line.host, ok: false, error: e.message };
         }
-      }
+      }));
       return json(results);
+    }
+
+    // 详情页实时内容
+    if (m[3] === 'content' && request.method === 'GET') {
+      return json(await withSession(env, account, fetchContent));
     }
 
     // 导出账号凭据：用于前端生成播放器一键导入链接（受面板密码保护，密码明文仅此处下发）
@@ -557,6 +866,18 @@ const HTML_PAGE = `<!DOCTYPE html>
   .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
   .chip { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; font-weight: 500; color: var(--text2); background: var(--fill); border-radius: 999px; padding: 4px 10px; }
   .chip svg { width: 13px; height: 13px; }
+  .chip.bad { color: var(--red); background: rgba(255,59,48,.12); }
+  .chip.warn { color: #ff9500; background: rgba(255,149,0,.13); }
+  .chip.info { color: var(--accent); background: var(--tint); }
+  .ilist .row { min-height: 44px; padding: 7px 14px; }
+  .ilist .im { flex: 1; min-width: 0; }
+  .ilist .im b { display: block; font-size: 14.5px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ilist .im i { display: block; font-style: normal; font-size: 12.5px; color: var(--text2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ilist .ir { flex-shrink: 0; font-size: 12.5px; color: var(--text2); }
+  .ilist .empty1 { color: var(--text3); font-size: 13.5px; }
+  .row-label.wide { width: auto; flex-shrink: 0; }
+  select.ipt { appearance: none; -webkit-appearance: none; cursor: pointer; direction: rtl; }
+  .lbadge { font-size: 11px; font-weight: 600; color: var(--accent); background: var(--tint); border-radius: 999px; padding: 1px 7px; margin-right: 4px; }
   .card-actions { display: flex; gap: 8px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--sep); }
   .card-actions .btn { padding: 6px 14px; font-size: 13.5px; }
   .card-actions .spacer { flex: 1; }
@@ -714,6 +1035,7 @@ const HTML_PAGE = `<!DOCTYPE html>
       <p class="sub" id="summary"></p>
     </div>
     <div class="top-btns">
+      <button class="btn tint sq" id="btnSettings" aria-label="设置"></button>
       <button class="btn tint" id="btnSort" aria-label="排序方式"></button>
       <button class="btn primary" id="btnAdd"></button>
     </div>
@@ -757,6 +1079,43 @@ const HTML_PAGE = `<!DOCTYPE html>
   </div>
 </div>
 
+<div class="overlay" id="settingsOverlay" hidden>
+  <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+    <header class="sheet-head">
+      <button class="btn ghost" id="btnSettingsCancel">取消</button>
+      <h2 id="settingsTitle">设置</h2>
+      <button class="btn primary" id="btnSettingsSave">保存</button>
+    </header>
+    <div class="sheet-body">
+      <h3 class="sec">自动巡检</h3>
+      <div class="group">
+        <div class="row"><span class="row-label wide">启用自动巡检</span><label class="switch"><input type="checkbox" id="s_cron"></label></div>
+        <div class="row"><span class="row-label wide">每个账号间隔</span><select class="ipt" id="s_interval">
+          <option value="6">6 小时</option><option value="12">12 小时</option><option value="24">1 天</option>
+          <option value="48">2 天</option><option value="72">3 天</option><option value="168">7 天</option>
+        </select></div>
+        <div class="row"><span class="row-label wide">每次最多检查</span><select class="ipt" id="s_batch">
+          <option value="1">1 个账号</option><option value="2">2 个账号</option><option value="3">3 个账号</option>
+          <option value="4">4 个账号</option><option value="5">5 个账号</option>
+        </select></div>
+      </div>
+      <p class="hint">巡检每小时触发一次，但只检查距上次检查超过间隔的账号（手动刷新也算一次检查），优先复用已保存的 token，不会重复登录。每个账号每次巡检约 4~5 个请求。关闭后不会自动访问任何 Emby 服务器。</p>
+      <h3 class="sec">通知</h3>
+      <div class="group">
+        <div class="row"><span class="row-label wide">通知渠道</span><span class="ipt" id="s_notify" style="color:var(--text2)"></span></div>
+      </div>
+      <p class="hint">在 Worker 环境变量中配置 TG_BOT_TOKEN + TG_CHAT_ID 或 BARK_URL。只在账号失效、恢复、被禁用时推送。</p>
+      <div class="sheet-actions" style="margin-top:12px"><button class="btn tint" id="btnNotifyTest">发送测试通知</button></div>
+      <h3 class="sec">详情页</h3>
+      <div class="group">
+        <div class="row"><span class="row-label wide">自动加载实时内容</span><label class="switch"><input type="checkbox" id="s_autoload"></label></div>
+        <div class="row"><span class="row-label wide">未观看提醒（天）</span><input class="ipt" id="s_inactive" inputmode="numeric"></div>
+      </div>
+      <p class="hint">实时内容包括在线会话、继续观看、下一集等，每次加载会向 Emby 发出 6 个请求，结果在本页缓存 5 分钟。关闭自动加载时，需在详情页手动点击加载。</p>
+    </div>
+  </div>
+</div>
+
 <div class="overlay" id="detailOverlay" hidden>
   <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="d_name">
     <header class="sheet-head">
@@ -790,7 +1149,15 @@ var ICONS = {
   import: '<path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/>',
   activity: '<path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"/>',
   check: '<polyline points="20 6 9 17 4 12"/>',
-  sort: '<path d="m3 16 4 4 4-4"/><path d="M7 20V4"/><path d="m21 8-4-4-4 4"/><path d="M17 4v16"/>'
+  sort: '<path d="m3 16 4 4 4-4"/><path d="M7 20V4"/><path d="m21 8-4-4-4 4"/><path d="M17 4v16"/>',
+  gear: '<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/>',
+  alert: '<circle cx="12" cy="12" r="10"/><line x1="12" x2="12" y1="8" y2="12"/><line x1="12" x2="12.01" y1="16" y2="16"/>',
+  play: '<polygon points="6 3 20 12 6 21 6 3"/>',
+  skip: '<polygon points="5 4 15 12 5 20 5 4"/><line x1="19" x2="19" y1="5" y2="19"/>',
+  sparkle: '<path d="M12 3l1.9 5.8L20 10l-6.1 1.2L12 17l-1.9-5.8L4 10l6.1-1.2Z"/>',
+  heart: '<path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z"/>',
+  folder: '<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>',
+  monitor: '<rect width="20" height="14" x="2" y="3" rx="2"/><line x1="8" x2="16" y1="21" y2="21"/><line x1="12" x2="12" y1="17" y2="21"/>'
 };
 function ic(name, cls) {
   return '<svg class="' + (cls || '') + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + ICONS[name] + '</svg>';
@@ -931,7 +1298,30 @@ function importSectionHtml(a) {
 }
 
 var ACCOUNTS = [];
+var SETTINGS = { cronEnabled: false, checkIntervalHours: 24, cronBatch: 3, autoLoadContent: false, inactiveDays: 30, notify: false };
 var editingId = null;
+
+// ---------- 状态 ----------
+function daysSince(ts) { return ts ? Math.floor((Date.now() - new Date(ts).getTime()) / 86400000) : null; }
+
+// 同一 ServerId 的其他账户（多个账户其实是同一台服务器）
+function sameServer(a) {
+  if (!a.serverId) return [];
+  return ACCOUNTS.filter(function(x) { return x.id !== a.id && x.serverId === a.serverId; });
+}
+
+// 卡片上的状态提示：登录失败 / 已禁用 / N 天未观看 / 同服
+function statusChips(a) {
+  var out = [];
+  if (a.health && a.health.ok === false) out.push('<span class="chip bad" title="' + esc(a.health.error) + '">' + ic('alert') + '登录失败</span>');
+  if (a.user && a.user.isDisabled) out.push('<span class="chip bad">' + ic('alert') + '已禁用</span>');
+  // 用最近观看时间判断活跃度：面板自己登录也会刷新 Emby 的 LastActivityDate，那个字段不可信
+  var d = daysSince(a.lastWatchedAt);
+  if (d !== null && d >= SETTINGS.inactiveDays) out.push('<span class="chip warn">' + ic('clock') + d + ' 天未观看</span>');
+  var same = sameServer(a);
+  if (same.length) out.push('<span class="chip info" title="与 ' + esc(same.map(function(x) { return x.name; }).join('、')) + ' 同一服务器">' + ic('server') + '同服 ×' + (same.length + 1) + '</span>');
+  return out;
+}
 
 // ---------- 排序 ----------
 var SORT_DEFS = [
@@ -1089,6 +1479,7 @@ function cardHtml(a) {
     var d = STAT_DEFS[i];
     if (c[d[2]]) chips.push(chip(d[0], c[d[2]], d[1]));
   }
+  var status = statusChips(a);
   var hue = hashHue(a.id || a.name || 'e');
   var watch = a.lastWatchedAt
     ? esc(relTime(a.lastWatchedAt)) + (a.lastWatchedName ? ' · <b>' + esc(a.lastWatchedName) + '</b>' : '')
@@ -1100,6 +1491,7 @@ function cardHtml(a) {
       ic('chevron', 'chev') +
     '</div>' +
     '<div class="watch">' + ic('clock', 'ic16') + '<span>' + watch + '</span></div>' +
+    (status.length ? '<div class="chips">' + status.join('') + '</div>' : '') +
     (chips.length ? '<div class="chips">' + chips.join('') + '</div>' : '') +
     '<div class="card-actions">' +
       '<button class="btn tint" data-action="refresh" data-id="' + a.id + '">' + ic('refresh', 'ic16') + '刷新</button>' +
@@ -1292,16 +1684,20 @@ function openDetail(id, keepScroll) {
     (a.lastWatchedAt ? '<span class="hint">' + fmtFull(a.lastWatchedAt) + '</span>' : '') +
     '</div></div>';
   var tiles = STAT_DEFS.map(function(d) { return tileHtml(d, c); }).join('');
+  var stats = a.lineStats || [];
   var lineRows = (a.lines || []).map(function(l, i) {
     return '<div class="row"><span class="row-label">' + esc(l.name || ('线路 ' + (i + 1))) + '</span>' +
       '<span class="ipt" style="color:var(--text2)">' + esc((l.https ? 'https://' : 'http://') + l.host + (l.port ? ':' + l.port : '') + (l.path || '')) + '</span>' +
-      '<span class="lstate unknown" data-ls="' + i + '"><span class="dot2"></span>未测试</span></div>';
+      (a.activeLine === i ? '<span class="lbadge">当前</span>' : '') +
+      lineStateHtml(stats[i]) + '</div>';
   }).join('');
   $('#d_body').innerHTML =
+    serverSectionHtml(a) +
     '<h3 class="sec">最近观看</h3>' + watch +
     '<h3 class="sec">资源数量</h3><div class="tiles">' + tiles + '</div>' +
+    '<div id="d_live"></div>' +
     '<h3 class="sec">线路</h3><div class="group linestatus">' + lineRows + '</div>' +
-    '<p class="hint">测试线路将逐条尝试登录，检查连通性。</p>' +
+    '<p class="hint">延迟为刷新时从 Cloudflare 节点测得，仅用于面板选择线路，和你本地的网络体验不一定一致。「测试线路」会逐条登录验证。</p>' +
     importSectionHtml(a) +
     '<div class="sheet-actions">' +
       '<button class="btn primary" data-action="refresh" data-id="' + a.id + '">' + ic('refresh', 'ic16') + '刷新数据</button>' +
@@ -1309,19 +1705,181 @@ function openDetail(id, keepScroll) {
       '<button class="btn tint" data-action="edit" data-id="' + a.id + '">' + ic('pencil', 'ic16') + '编辑</button>' +
     '</div>';
   openOverlay($('#detailOverlay'));
+  showLive(a.id);
+}
+
+function lineStateHtml(s) {
+  if (!s) return '<span class="lstate unknown"><span class="dot2"></span>未测试</span>';
+  if (s.ok) return '<span class="lstate ok"><span class="dot2"></span>' + (s.ms != null ? s.ms + ' ms' : '可用') + '</span>';
+  return '<span class="lstate bad" title="' + esc(s.error) + '"><span class="dot2"></span>' + esc(s.error || '不可用') + '</span>';
+}
+
+function serverSectionHtml(a) {
+  var rows = [];
+  var h = a.health;
+  if (h) {
+    rows.push(['状态', h.ok
+      ? '<span class="lstate ok"><span class="dot2"></span>正常</span>'
+      : '<span class="lstate bad"><span class="dot2"></span>登录失败</span>']);
+  }
+  if (a.user) rows.push(['账号', a.user.isDisabled ? '<span class="lstate bad"><span class="dot2"></span>已被禁用</span>' : '<span class="lstate ok"><span class="dot2"></span>启用中</span>']);
+  if (a.server) {
+    if (a.server.name) rows.push(['服务器', esc(a.server.name)]);
+    if (a.server.version) rows.push(['版本', esc(a.server.version)]);
+  }
+  var same = sameServer(a);
+  if (same.length) rows.push(['同服', esc(same.map(function(x) { return x.name; }).join('、'))]);
+  if (h && h.checkedAt) rows.push(['检查于', esc(relTime(h.checkedAt))]);
+  if (!rows.length) return '';
+  var html = '<h3 class="sec">状态</h3><div class="group">' + rows.map(function(r) {
+    return '<div class="row"><span class="row-label">' + r[0] + '</span><span class="ipt" style="color:var(--text2)">' + r[1] + '</span></div>';
+  }).join('') + '</div>';
+  if (h && !h.ok && h.error) html += '<div class="formmsg"><div class="msg">' + esc(h.error) + '</div></div>';
+  return html;
+}
+
+// ---------- 详情页实时内容 ----------
+var LIVE_DEFS = [
+  ['sessions', '在线会话', 'monitor'],
+  ['resume', '继续观看', 'play'],
+  ['nextUp', '下一集', 'skip'],
+  ['latest', '最近入库', 'sparkle'],
+  ['favorites', '收藏', 'heart'],
+  ['views', '媒体库', 'folder']
+];
+var VIEW_TYPES = { movies: '电影', tvshows: '剧集', music: '音乐', books: '图书', homevideos: '家庭视频', musicvideos: 'MV', boxsets: '合集', playlists: '播放列表', photos: '照片' };
+var liveSeq = 0;
+
+function itemTitle(it) {
+  if (it.type === 'Episode') {
+    var se = (it.season != null ? 'S' + it.season : '') + (it.episode != null ? 'E' + it.episode : '');
+    return { main: it.series || it.name, sub: [se, it.name].filter(Boolean).join(' · ') };
+  }
+  var t = { Movie: '电影', Series: '剧集', Audio: '歌曲', MusicAlbum: '专辑', Book: '图书' }[it.type] || it.type;
+  return { main: it.name, sub: [t, it.year].filter(Boolean).join(' · ') };
+}
+
+function liveRow(main, sub, right) {
+  return '<div class="row"><div class="im"><b>' + esc(main) + '</b>' + (sub ? '<i>' + esc(sub) + '</i>' : '') + '</div>' +
+    (right ? '<span class="ir">' + esc(right) + '</span>' : '') + '</div>';
+}
+
+function liveRows(key, data) {
+  if (key === 'views') {
+    return data.map(function(v) { return liveRow(v.name, VIEW_TYPES[v.type] || v.type || ''); });
+  }
+  if (key === 'sessions') {
+    return data.map(function(s) {
+      var p = s.playing ? itemTitle(s.playing) : null;
+      var main = (s.device || '未知设备') + (s.client ? ' · ' + s.client : '');
+      var sub = p ? (s.paused ? '已暂停：' : '正在播放：') + p.main + (p.sub ? ' ' + p.sub : '') : '空闲';
+      return liveRow(main, sub + (s.ip ? '  ' + s.ip : ''), s.lastActivity ? relTime(s.lastActivity) : '');
+    });
+  }
+  return data.map(function(it) {
+    var t = itemTitle(it);
+    var right = it.percent ? it.percent + '%' : (key === 'latest' && it.childCount > 1 ? it.childCount + ' 项' : '');
+    return liveRow(t.main, t.sub, right);
+  });
+}
+
+// 实时内容缓存：同一账户 5 分钟内重复打开详情页、刷新后重新渲染都不再请求 Emby
+var LIVE_CACHE = {};
+var LIVE_TTL = 5 * 60 * 1000;
+
+function liveButtonHtml(id, label) {
+  return '<div class="sheet-actions" style="margin-top:22px"><button class="btn tint" data-action="live" data-id="' + id + '">' +
+    ic('refresh', 'ic16') + label + '</button></div>';
+}
+
+// 打开详情页时调用：有缓存用缓存；没有缓存且未开自动加载，只显示按钮
+function showLive(id) {
+  var c = LIVE_CACHE[id];
+  if (c && Date.now() - c.at < LIVE_TTL) { renderLive(id, c.data, c.at); return; }
+  if (SETTINGS.autoLoadContent) { loadLive(id, false); return; }
+  $('#d_live').innerHTML = liveButtonHtml(id, '加载在线会话、继续观看等内容') +
+    '<p class="hint">会向 Emby 服务器发出 6 个请求。可在设置中开启自动加载。</p>';
+}
+
+async function loadLive(id, force) {
+  var c = LIVE_CACHE[id];
+  if (!force && c && Date.now() - c.at < LIVE_TTL) { renderLive(id, c.data, c.at); return; }
+  var seq = ++liveSeq;
+  var box = $('#d_live');
+  box.innerHTML = '<p class="hint">正在加载在线会话、继续观看等内容…</p>';
+  try {
+    var d = await api('/api/accounts/' + id + '/content');
+    LIVE_CACHE[id] = { data: d, at: Date.now() };
+    if (seq !== liveSeq || !box.isConnected) return; // 已切换到别的账户或重新渲染
+    renderLive(id, d, LIVE_CACHE[id].at);
+  } catch (e) {
+    if (seq !== liveSeq || !box.isConnected) return;
+    box.innerHTML = '<p class="hint">实时内容加载失败：' + esc(e.message) + '</p>' + liveButtonHtml(id, '重试');
+  }
+}
+
+function renderLive(id, d, at) {
+  $('#d_live').innerHTML = LIVE_DEFS.map(function(def) {
+      var v = d[def[0]];
+      var body;
+      if (!v) return '';
+      if (v.error) body = '<div class="row"><span class="empty1">获取失败：' + esc(v.error) + '</span></div>';
+      else if (!v.length) body = '<div class="row"><span class="empty1">' + (def[0] === 'sessions' ? '当前没有其他设备在线' : '暂无') + '</span></div>';
+      else body = liveRows(def[0], v).join('');
+      return '<h3 class="sec">' + def[1] + '</h3><div class="group ilist">' + body + '</div>';
+    }).join('') +
+    '<p class="hint">获取于 ' + esc(relTime(at)) + '，5 分钟内重复打开使用缓存。</p>' +
+    liveButtonHtml(id, '重新加载实时内容');
+}
+
+// ---------- 设置 ----------
+async function openSettings() {
+  try { SETTINGS = await api('/api/settings'); } catch (e) { toast('读取设置失败：' + e.message, 'err'); return; }
+  $('#s_cron').checked = !!SETTINGS.cronEnabled;
+  $('#s_interval').value = String(SETTINGS.checkIntervalHours);
+  $('#s_batch').value = String(SETTINGS.cronBatch);
+  $('#s_autoload').checked = !!SETTINGS.autoLoadContent;
+  $('#s_inactive').value = String(SETTINGS.inactiveDays);
+  $('#s_notify').textContent = SETTINGS.notify ? '已配置' : '未配置';
+  openOverlay($('#settingsOverlay'));
+}
+
+async function saveSettings() {
+  var btn = $('#btnSettingsSave');
+  btn.disabled = true;
+  try {
+    SETTINGS = await api('/api/settings', { method: 'PUT', body: JSON.stringify({
+      cronEnabled: $('#s_cron').checked,
+      checkIntervalHours: Number($('#s_interval').value),
+      cronBatch: Number($('#s_batch').value),
+      autoLoadContent: $('#s_autoload').checked,
+      inactiveDays: Number($('#s_inactive').value)
+    }) });
+    closeOverlay($('#settingsOverlay'));
+    toast('设置已保存');
+    render();
+  } catch (e) { toast('保存失败：' + e.message, 'err'); }
+  finally { btn.disabled = false; }
+}
+
+async function testNotify() {
+  try {
+    var r = await api('/api/notify/test', { method: 'POST' });
+    toast('已发送到 ' + r.sent + ' 个渠道');
+  } catch (e) { toast('发送失败：' + e.message, 'err'); }
 }
 
 async function testLines(id) {
   var a = ACCOUNTS.find(function(x) { return x.id === id; });
   if (!a) return;
-  var marks = document.querySelectorAll('#d_body .lstate');
+  var marks = document.querySelectorAll('#d_body .linestatus .lstate');
   marks.forEach(function(m) { m.className = 'lstate unknown'; m.innerHTML = '<span class="dot2"></span>测试中'; });
   try {
     var results = await api('/api/accounts/' + id + '/test', { method: 'POST' });
     marks.forEach(function(m, i) {
       var r = results[i];
       if (!r) return;
-      if (r.ok) { m.className = 'lstate ok'; m.innerHTML = '<span class="dot2"></span>可用'; }
+      if (r.ok) { m.className = 'lstate ok'; m.innerHTML = '<span class="dot2"></span>可用 · 登录 ' + r.ms + ' ms'; }
       else {
         m.className = 'lstate bad';
         m.innerHTML = '<span class="dot2"></span>';
@@ -1397,11 +1955,16 @@ document.addEventListener('click', function(e) {
     else if (action === 'eye') toggleEye(act);
     else if (action === 'import') doImport(id, act.getAttribute('data-app'));
     else if (action === 'copyinfo') copyInfo(id);
+    else if (action === 'live') loadLive(id, true);
     else if (action === 'delline') { act.closest('.line').remove(); renumberLines(); }
     return;
   }
   if (e.target.closest('#btnAdd') || e.target.closest('#btnEmptyAdd')) { openAdd(); return; }
   if (e.target.closest('#btnSort')) { openSort(); return; }
+  if (e.target.closest('#btnSettings')) { openSettings(); return; }
+  if (e.target.closest('#btnSettingsCancel')) { closeOverlay($('#settingsOverlay')); return; }
+  if (e.target.closest('#btnSettingsSave')) { saveSettings(); return; }
+  if (e.target.closest('#btnNotifyTest')) { testNotify(); return; }
   if (e.target.closest('#btnSortClose')) { closeOverlay($('#sortOverlay')); return; }
   var srow = e.target.closest('[data-skey]');
   if (srow) { pickSort(srow.getAttribute('data-skey')); return; }
@@ -1427,11 +1990,12 @@ document.addEventListener('keydown', function(e) {
 
 function initChrome() {
   $('#btnAdd').innerHTML = ic('plus', 'ic16') + '添加账户';
+  $('#btnSettings').innerHTML = ic('gear', 'ic16');
   $('#btnAddLine').innerHTML = ic('plus', 'ic16') + '添加备用线路';
   updateSortBtn();
 }
 initChrome();
-loadAccounts();
+api('/api/settings').then(function(s) { SETTINGS = s; }).catch(function() {}).then(loadAccounts);
 </script>
 </body>
 </html>

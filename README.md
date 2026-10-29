@@ -15,6 +15,10 @@
   线路名称、主机、端口、路径、https 开关、用户名、密码
 - 保存时逐条线路尝试登录，可用的作为主线路；刷新时自动切换到第一条可用线路
 - 详情页可单独测试每条线路的连通性
+- **账号状态**：卡片显示"登录失败"、"已禁用"、"N 天未观看"（天数在设置中调整，默认 30），多个账户属于同一台服务器（相同 ServerId）时显示"同服"
+- **线路测速**：手动刷新时并行探测所有线路，用延迟最低的可用线路（延迟从 Cloudflare 节点测得，不改动你设置的主线路顺序）
+- **详情页实时内容**：在线会话（排查合租账号被他人使用）、继续观看、下一集、最近入库、收藏、媒体库列表。默认手动加载，结果缓存 5 分钟
+- **定时巡检 + 通知**：默认关闭，在面板「设置」中开启；状态变化（失效 / 恢复 / 被禁用）时推送到 Telegram 或 Bark
 - Emby 密码可选 AES-256-GCM 加密存储（配置 `ENCRYPT_KEY`）
 - 可选的访问密码保护（`ACCESS_PASSWORD`）
 - **一键导入到播放器**：详情页可生成带凭据的深链，一键唤起 App 完成服务器导入
@@ -35,6 +39,22 @@
 1. 进入 Cloudflare 控制台 → 你的 Worker → **Settings → Variables and Secrets**
 2. （推荐）添加变量 `ENCRYPT_KEY`，值为 `openssl rand -hex 32` 生成的随机串，启用密码加密存储
 3. （可选）添加变量 `ACCESS_PASSWORD`，给面板加一道访问密码
+4. （可选）配置巡检通知：`TG_BOT_TOKEN` + `TG_CHAT_ID`，或 `BARK_URL`（如 `https://api.day.app/<key>`），然后在面板「设置」里点「发送测试通知」验证
+
+### 请求频率说明
+
+面板不会在后台频繁访问 Emby 服务器，所有自动行为都在「设置」中控制：
+
+| 行为 | 何时访问 Emby | 控制方式 |
+|---|---|---|
+| 打开页面 / 账户列表 | 不访问（只读 KV） | — |
+| 自动巡检 | Cron 每小时触发，但只检查距上次检查超过间隔（6 小时 ~ 7 天，默认 1 天）的账号，每次最多 1~5 个（默认 3），每个约 4~5 个请求 | 默认**关闭** |
+| 详情页实时内容 | 点击加载时发 6 个请求，5 分钟内重复打开用缓存 | 默认手动，可开自动加载 |
+| 刷新 / 测试线路 / 保存 | 仅手动点击时 | — |
+
+- 手动刷新也算一次检查，会推迟该账号的下次自动巡检
+- 巡检优先复用缓存的 token，失效才重新登录，不会在 Emby 后台留下大量登录记录
+- 只在状态**变化**时推送，不会每次巡检都重复提醒
 
 ## 手动部署
 
@@ -61,6 +81,10 @@ wrangler deploy
 - 资源数量：`GET /emby/Items/Counts`（电影、剧集、集数、音乐等总数）
 - 最近观看：`GET /emby/Users/{userId}/PlayedItems/Latest`，后备
   `GET /emby/Items?SortBy=DatePlayed&Filters=IsPlayed`，取 `UserData.LastPlayedDate`
+- 账号状态：`GET /emby/Users/{userId}`，取 `Policy.IsDisabled`（同时用来校验缓存 token 是否有效）
+- 服务器信息 / 测速：`GET /emby/System/Info/Public`（无需登录），取 `ServerName`、`Version`、`Id`
+- 详情页实时内容：`/Users/{id}/Views`、`/Users/{id}/Items/Resume`、`/Shows/NextUp`、`/Users/{id}/Items/Latest`、
+  `/Users/{id}/Items?Filters=IsFavorite`、`/Sessions`（按当前用户过滤）
 
 ## 注意
 
