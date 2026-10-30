@@ -488,13 +488,13 @@ function healthAlert(prev, a) {
 
 // ---------- 面板设置（KV: settings，页面可改） ----------
 const DEFAULT_SETTINGS = {
-  cronEnabled: false,       // 自动巡检，默认关闭
-  checkIntervalHours: 24,   // 同一账号两次巡检的最短间隔（手动刷新也算一次检查）
+  cronEnabled: true,        // 自动巡检，默认开启
+  checkIntervalDays: 1,     // 同一账号两次巡检的间隔（天）；手动刷新也算一次检查
   cronBatch: 3,             // 每次触发最多检查几个账号
   autoLoadContent: false,   // 打开详情页时自动拉取实时内容
   inactiveDays: 30,         // 超过多少天未观看提示
 };
-const INTERVAL_OPTIONS = [6, 12, 24, 48, 72, 168];
+const INTERVAL_OPTIONS = [1, 2, 3, 5, 7, 14, 30];
 
 async function getSettings(env) {
   const s = await env.KV.get('settings', 'json').catch(() => null);
@@ -507,19 +507,31 @@ function sanitizeSettings(body, cur) {
     const n = parseInt(v, 10);
     return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : def;
   };
-  const hours = int(body.checkIntervalHours, 6, 168, cur.checkIntervalHours);
+  const days = int(body.checkIntervalDays, 1, 30, cur.checkIntervalDays);
   return {
     cronEnabled: typeof body.cronEnabled === 'boolean' ? body.cronEnabled : cur.cronEnabled,
-    checkIntervalHours: INTERVAL_OPTIONS.includes(hours) ? hours : cur.checkIntervalHours,
+    checkIntervalDays: INTERVAL_OPTIONS.includes(days) ? days : cur.checkIntervalDays,
     cronBatch: int(body.cronBatch, 1, 5, cur.cronBatch),
     autoLoadContent: typeof body.autoLoadContent === 'boolean' ? body.autoLoadContent : cur.autoLoadContent,
     inactiveDays: int(body.inactiveDays, 1, 3650, cur.inactiveDays),
   };
 }
 
+/** 巡检一个账号并写回 KV，返回状态变化提醒（无变化为 null）；子请求超限时原样抛出 */
+async function checkAccount(env, account) {
+  const prev = { health: account.health, user: account.user };
+  try {
+    await refreshAccount(env, account);
+  } catch (e) {
+    if (isSubrequestLimit(e)) throw e; // 额度用完不算失败，不写回
+  }
+  await env.KV.put(`acct:${account.id}`, JSON.stringify(account));
+  return healthAlert(prev, account);
+}
+
 /**
- * Cron 每小时触发一次，但只检查"距上次检查超过间隔"的账号，按最久未检查优先，
- * 每次最多 cronBatch 个。关闭巡检时不访问任何 Emby 服务器。
+ * Cron 每小时触发一次，只检查"距上次检查已满间隔天数"的账号，按最久未检查优先，
+ * 每次最多 cronBatch 个（账号多时分摊到不同小时）。关闭巡检时不访问任何 Emby 服务器。
  */
 async function runScheduledCheck(env) {
   const settings = await getSettings(env);
@@ -528,22 +540,18 @@ async function runScheduledCheck(env) {
   if (!ids.length) return;
   const accounts = (await Promise.all(ids.map(id => env.KV.get(`acct:${id}`, 'json')))).filter(Boolean);
   const checkedAt = a => Date.parse(a.health && a.health.checkedAt) || 0;
-  const cutoff = Date.now() - settings.checkIntervalHours * 3600 * 1000;
+  // 留 1 小时余量：整点触发有几秒误差，不留的话"每天一次"会逐渐漂移成 25 小时
+  const cutoff = Date.now() - (settings.checkIntervalDays * 24 - 1) * 3600 * 1000;
   const due = accounts.filter(a => checkedAt(a) <= cutoff)
     .sort((a, b) => checkedAt(a) - checkedAt(b))
     .slice(0, settings.cronBatch);
 
   const alerts = [];
   for (const account of due) {
-    const prev = { health: account.health, user: account.user };
     try {
-      await refreshAccount(env, account);
-    } catch (e) {
-      if (isSubrequestLimit(e)) break; // 额度用完，剩下的留给下一轮，不算失败
-    }
-    await env.KV.put(`acct:${account.id}`, JSON.stringify(account));
-    const msg = healthAlert(prev, account);
-    if (msg) alerts.push(msg);
+      const msg = await checkAccount(env, account);
+      if (msg) alerts.push(msg);
+    } catch (_) { break; } // 子请求额度用完，剩下的留给下一轮
   }
   if (alerts.length) {
     try { await notify(env, 'Emby 账号巡检', alerts.join('\n\n')); } catch (e) { console.error('通知发送失败', e.message); }
@@ -652,7 +660,7 @@ async function handleApi(request, env, url, path) {
   }
 
   // 单个账号
-  const m = path.match(/^\/api\/accounts\/([\w-]+)(\/(refresh|test|export|content))?$/);
+  const m = path.match(/^\/api\/accounts\/([\w-]+)(\/(refresh|test|export|content|check))?$/);
   if (m) {
     const id = m[1];
     const raw = await env.KV.get(`acct:${id}`);
@@ -715,6 +723,15 @@ async function handleApi(request, env, url, path) {
         }
       }));
       return json(results);
+    }
+
+    // 手动巡检单个账号（设置页"立即巡检"按钮逐个调用；状态变化时同样推送通知）
+    if (m[3] === 'check' && request.method === 'POST') {
+      const msg = await checkAccount(env, account);
+      if (msg) {
+        try { await notify(env, 'Emby 账号巡检', msg); } catch (e) { console.error('通知发送失败', e.message); }
+      }
+      return json({ name: account.name, ok: !!(account.health && account.health.ok), error: account.health && account.health.error, changed: !!msg });
     }
 
     // 详情页实时内容
@@ -1090,16 +1107,19 @@ const HTML_PAGE = `<!DOCTYPE html>
       <h3 class="sec">自动巡检</h3>
       <div class="group">
         <div class="row"><span class="row-label wide">启用自动巡检</span><label class="switch"><input type="checkbox" id="s_cron"></label></div>
-        <div class="row"><span class="row-label wide">每个账号间隔</span><select class="ipt" id="s_interval">
-          <option value="6">6 小时</option><option value="12">12 小时</option><option value="24">1 天</option>
-          <option value="48">2 天</option><option value="72">3 天</option><option value="168">7 天</option>
+        <div class="row"><span class="row-label wide">巡检频率</span><select class="ipt" id="s_interval">
+          <option value="1">每天一次</option><option value="2">每 2 天一次</option><option value="3">每 3 天一次</option>
+          <option value="5">每 5 天一次</option><option value="7">每 7 天一次</option><option value="14">每 14 天一次</option>
+          <option value="30">每 30 天一次</option>
         </select></div>
         <div class="row"><span class="row-label wide">每次最多检查</span><select class="ipt" id="s_batch">
           <option value="1">1 个账号</option><option value="2">2 个账号</option><option value="3">3 个账号</option>
           <option value="4">4 个账号</option><option value="5">5 个账号</option>
         </select></div>
       </div>
-      <p class="hint">巡检每小时触发一次，但只检查距上次检查超过间隔的账号（手动刷新也算一次检查），优先复用已保存的 token，不会重复登录。每个账号每次巡检约 4~5 个请求。关闭后不会自动访问任何 Emby 服务器。</p>
+      <p class="hint">每个账号按所选频率检查一次（手动刷新也算一次检查）；账号较多时会分摊到不同时段，每次最多检查所设数量。优先复用已保存的 token，不会重复登录，每个账号每次约 3~5 个请求。关闭后不会自动访问任何 Emby 服务器。</p>
+      <div class="sheet-actions" style="margin-top:12px"><button class="btn tint" id="btnCheckNow">立即巡检全部账户</button></div>
+      <p class="hint" id="s_checkmsg"></p>
       <h3 class="sec">通知</h3>
       <div class="group">
         <div class="row"><span class="row-label wide">通知渠道</span><span class="ipt" id="s_notify" style="color:var(--text2)"></span></div>
@@ -1298,7 +1318,7 @@ function importSectionHtml(a) {
 }
 
 var ACCOUNTS = [];
-var SETTINGS = { cronEnabled: false, checkIntervalHours: 24, cronBatch: 3, autoLoadContent: false, inactiveDays: 30, notify: false };
+var SETTINGS = { cronEnabled: true, checkIntervalDays: 1, cronBatch: 3, autoLoadContent: false, inactiveDays: 30, notify: false };
 var editingId = null;
 
 // ---------- 状态 ----------
@@ -1836,7 +1856,8 @@ function renderLive(id, d, at) {
 async function openSettings() {
   try { SETTINGS = await api('/api/settings'); } catch (e) { toast('读取设置失败：' + e.message, 'err'); return; }
   $('#s_cron').checked = !!SETTINGS.cronEnabled;
-  $('#s_interval').value = String(SETTINGS.checkIntervalHours);
+  $('#s_interval').value = String(SETTINGS.checkIntervalDays);
+  if (!checking) $('#s_checkmsg').textContent = '';
   $('#s_batch').value = String(SETTINGS.cronBatch);
   $('#s_autoload').checked = !!SETTINGS.autoLoadContent;
   $('#s_inactive').value = String(SETTINGS.inactiveDays);
@@ -1850,7 +1871,7 @@ async function saveSettings() {
   try {
     SETTINGS = await api('/api/settings', { method: 'PUT', body: JSON.stringify({
       cronEnabled: $('#s_cron').checked,
-      checkIntervalHours: Number($('#s_interval').value),
+      checkIntervalDays: Number($('#s_interval').value),
       cronBatch: Number($('#s_batch').value),
       autoLoadContent: $('#s_autoload').checked,
       inactiveDays: Number($('#s_inactive').value)
@@ -1860,6 +1881,27 @@ async function saveSettings() {
     render();
   } catch (e) { toast('保存失败：' + e.message, 'err'); }
   finally { btn.disabled = false; }
+}
+
+// 立即巡检：逐个账号调用（每个账号一次请求，避免单次调用超出子请求上限）
+var checking = false;
+async function checkNow() {
+  if (checking || !ACCOUNTS.length) return;
+  checking = true;
+  var btn = $('#btnCheckNow'), msg = $('#s_checkmsg');
+  btn.disabled = true;
+  var list = ACCOUNTS.slice(), bad = [];
+  try {
+    for (var i = 0; i < list.length; i++) {
+      msg.textContent = '正在检查 ' + (i + 1) + ' / ' + list.length + '：' + list[i].name;
+      try {
+        var r = await api('/api/accounts/' + list[i].id + '/check', { method: 'POST' });
+        if (!r.ok) bad.push(list[i].name);
+      } catch (e) { bad.push(list[i].name); }
+    }
+    msg.textContent = '巡检完成：' + (list.length - bad.length) + ' 个正常' + (bad.length ? '，' + bad.length + ' 个异常（' + bad.join('、') + '）' : '');
+    await loadAccounts();
+  } finally { checking = false; btn.disabled = false; }
 }
 
 async function testNotify() {
@@ -1965,6 +2007,7 @@ document.addEventListener('click', function(e) {
   if (e.target.closest('#btnSettingsCancel')) { closeOverlay($('#settingsOverlay')); return; }
   if (e.target.closest('#btnSettingsSave')) { saveSettings(); return; }
   if (e.target.closest('#btnNotifyTest')) { testNotify(); return; }
+  if (e.target.closest('#btnCheckNow')) { checkNow(); return; }
   if (e.target.closest('#btnSortClose')) { closeOverlay($('#sortOverlay')); return; }
   var srow = e.target.closest('[data-skey]');
   if (srow) { pickSort(srow.getAttribute('data-skey')); return; }
