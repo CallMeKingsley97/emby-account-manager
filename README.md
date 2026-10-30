@@ -1,4 +1,3 @@
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/CallMeKingsley97/emby-account-manager)
 
 # Emby 账号管理器
 
