@@ -892,6 +892,12 @@ const HTML_PAGE = `<!DOCTYPE html>
   .ilist .im i { display: block; font-style: normal; font-size: 12.5px; color: var(--text2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .ilist .ir { flex-shrink: 0; font-size: 12.5px; color: var(--text2); }
   .ilist .empty1 { color: var(--text3); font-size: 13.5px; }
+  .fold > summary { list-style: none; display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; -webkit-tap-highlight-color: transparent; }
+  .fold > summary::-webkit-details-marker { display: none; }
+  .fold > summary .ic16 { color: var(--text2); }
+  .fold .fcount { font-size: 12.5px; font-weight: 500; color: var(--text2); background: var(--fill); border-radius: 999px; padding: 1px 8px; }
+  .fold .fchev { margin-left: auto; color: var(--text3); transition: transform .2s var(--ease); }
+  .fold[open] .fchev { transform: rotate(90deg); }
   .row-label.wide { width: auto; flex-shrink: 0; }
   select.ipt { appearance: none; -webkit-appearance: none; cursor: pointer; direction: rtl; }
   .lbadge { font-size: 11px; font-weight: 600; color: var(--accent); background: var(--tint); border-radius: 999px; padding: 1px 7px; margin-right: 4px; }
@@ -1779,9 +1785,9 @@ function itemTitle(it) {
   return { main: it.name, sub: [t, it.year].filter(Boolean).join(' · ') };
 }
 
-function liveRow(main, sub, right) {
+function liveRow(main, sub, right, title) {
   return '<div class="row"><div class="im"><b>' + esc(main) + '</b>' + (sub ? '<i>' + esc(sub) + '</i>' : '') + '</div>' +
-    (right ? '<span class="ir">' + esc(right) + '</span>' : '') + '</div>';
+    (right ? '<span class="ir"' + (title ? ' title="' + esc(title) + '"' : '') + '>' + esc(right) + '</span>' : '') + '</div>';
 }
 
 function liveRows(key, data) {
@@ -1798,10 +1804,25 @@ function liveRows(key, data) {
   }
   return data.map(function(it) {
     var t = itemTitle(it);
-    var right = it.percent ? it.percent + '%' : (key === 'latest' && it.childCount > 1 ? it.childCount + ' 项' : '');
-    return liveRow(t.main, t.sub, right);
+    var right = [
+      it.percent ? it.percent + '%' : '',
+      key === 'latest' && it.childCount > 1 ? it.childCount + ' 项' : '',
+      it.lastPlayed ? '播放于 ' + relTime(it.lastPlayed) : ''
+    ].filter(Boolean).join(' · ');
+    return liveRow(t.main, t.sub, right, it.lastPlayed ? '最近一次播放：' + fmtFull(it.lastPlayed) : '');
   });
 }
+
+// 折叠状态记在本机，默认全部收起
+var LIVE_OPEN = (function() {
+  try { return JSON.parse(localStorage.getItem('emby-live-open') || '{}') || {}; } catch (_) { return {}; }
+})();
+document.addEventListener('toggle', function(e) {
+  var key = e.target.getAttribute && e.target.getAttribute('data-live');
+  if (!key) return;
+  LIVE_OPEN[key] = e.target.open;
+  try { localStorage.setItem('emby-live-open', JSON.stringify(LIVE_OPEN)); } catch (_) {}
+}, true);
 
 // 实时内容缓存：同一账户 5 分钟内重复打开详情页、刷新后重新渲染都不再请求 Emby
 var LIVE_CACHE = {};
@@ -1841,12 +1862,14 @@ async function loadLive(id, force) {
 function renderLive(id, d, at) {
   $('#d_live').innerHTML = LIVE_DEFS.map(function(def) {
       var v = d[def[0]];
-      var body;
+      var body, count;
       if (!v) return '';
-      if (v.error) body = '<div class="row"><span class="empty1">获取失败：' + esc(v.error) + '</span></div>';
-      else if (!v.length) body = '<div class="row"><span class="empty1">' + (def[0] === 'sessions' ? '当前没有其他设备在线' : '暂无') + '</span></div>';
-      else body = liveRows(def[0], v).join('');
-      return '<h3 class="sec">' + def[1] + '</h3><div class="group ilist">' + body + '</div>';
+      if (v.error) { body = '<div class="row"><span class="empty1">获取失败：' + esc(v.error) + '</span></div>'; count = '失败'; }
+      else if (!v.length) { body = '<div class="row"><span class="empty1">' + (def[0] === 'sessions' ? '当前没有其他设备在线' : '暂无') + '</span></div>'; count = '0'; }
+      else { body = liveRows(def[0], v).join(''); count = String(v.length); }
+      return '<details class="fold" data-live="' + def[0] + '"' + (LIVE_OPEN[def[0]] ? ' open' : '') + '>' +
+        '<summary class="sec">' + ic(def[2], 'ic16') + '<span>' + def[1] + '</span><span class="fcount">' + count + '</span>' + ic('chevron', 'ic16 fchev') + '</summary>' +
+        '<div class="group ilist">' + body + '</div></details>';
     }).join('') +
     '<p class="hint">获取于 ' + esc(relTime(at)) + '，5 分钟内重复打开使用缓存。</p>' +
     liveButtonHtml(id, '重新加载实时内容');
